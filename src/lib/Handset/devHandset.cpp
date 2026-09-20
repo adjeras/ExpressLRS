@@ -5,6 +5,9 @@
 #include "CRSFHandset.h"
 #include "POWERMGNT.h"
 #include "devHandset.h"
+#if defined(TORQUE_DOLLY_HANDSET)
+#include "TorqueDollyHandset.h"
+#endif
 
 #include "CRSFEndpoint.h"
 #include "options.h"
@@ -17,13 +20,17 @@ Handset *handset;
 
 static bool initialize()
 {
-#if defined(PLATFORM_ESP32)
+#if defined(TORQUE_DOLLY_HANDSET)
+    handset = new TorqueDollyHandset();
+    return true;
+#elif defined(PLATFORM_ESP32)
     if (GPIO_PIN_RCSIGNAL_RX == GPIO_PIN_RCSIGNAL_TX)
     {
         handset = new AutoDetect();
         return true;
     }
 #endif
+
     handset = new CRSFHandset();
     return true;
 }
