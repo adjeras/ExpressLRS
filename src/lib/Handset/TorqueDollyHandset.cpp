@@ -130,8 +130,6 @@ void TorqueDollyHandset::End()
 
 void TorqueDollyHandset::handleInput()
 {
-    static uint32_t lastDiagnosticMs = 0;
-
     const int xRaw = analogRead(PIN_JOY_X);
     const int yRaw = analogRead(PIN_JOY_Y);
 
@@ -149,21 +147,6 @@ void TorqueDollyHandset::handleInput()
 
     const float xNormalized = normalizeAxis(xFiltered, X_MIN, X_CENTER, X_MAX);
     const float yNormalized = normalizeAxis(yFiltered, Y_MIN, Y_CENTER, Y_MAX);
-    const bool diagnosticStartup = startupNeutral;
-
-    const auto printDiagnostic = [&](float leftDrive, float rightDrive,
-                                     uint32_t ch1, uint32_t ch2) {
-        const uint32_t now = millis();
-        if (now - lastDiagnosticMs >= 200)
-        {
-            USBSerial.printf(
-                "RAW X=%d Y=%d NORM X=%.2f Y=%.2f DRIVE X=%.2f Y=%.2f "
-                "LEFT=%.2f RIGHT=%.2f CH1=%u CH2=%u STARTUP=%d\n",
-                xRaw, yRaw, xNormalized, yNormalized, xDrive, yDrive,
-                leftDrive, rightDrive, ch1, ch2, diagnosticStartup ? 1 : 0);
-            lastDiagnosticMs = now;
-        }
-    };
 
     if (startupNeutral)
     {
@@ -183,7 +166,6 @@ void TorqueDollyHandset::handleInput()
         PerformChannelOverrides(localChannelData, CRSF_NUM_CHANNELS);
         localChannelData[0] = CRSF_CHANNEL_VALUE_MID;
         localChannelData[1] = CRSF_CHANNEL_VALUE_MID;
-        printDiagnostic(0.0f, 0.0f, localChannelData[0], localChannelData[1]);
         RCDataReceived(localChannelData, CRSF_NUM_CHANNELS);
         return;
     }
@@ -226,7 +208,6 @@ void TorqueDollyHandset::handleInput()
     localChannelData[1] = mapDriveToCrsfChannel(rightDrive);
 
     PerformChannelOverrides(localChannelData, CRSF_NUM_CHANNELS);
-    printDiagnostic(leftDrive, rightDrive, localChannelData[0], localChannelData[1]);
     RCDataReceived(localChannelData, CRSF_NUM_CHANNELS);
 }
 
