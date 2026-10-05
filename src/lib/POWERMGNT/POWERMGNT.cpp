@@ -273,7 +273,11 @@ void POWERMGNT::setDefaultPower()
 
 void POWERMGNT::setPower(PowerLevels_e Power)
 {
+#if defined(TORQUE_DOLLY_RF_TEST)
+    Power = MinPower;
+#else
     Power = constrain(Power, getMinPower(), getMaxPower());
+#endif
     PowerLevels_e PowerDual = Power;
 
     if (Power == CurrentPower)
@@ -319,7 +323,11 @@ void POWERMGNT::setPower(PowerLevels_e Power)
     }
     else if (powerValues != nullptr)
     {
+#if defined(TORQUE_DOLLY_RF_TEST)
+        CurrentSX1280Power = powerValues[Power - MinPower];
+#else
         CurrentSX1280Power = powerValues[Power - MinPower] + powerCaliValues[Power];
+#endif
         Radio.SetOutputPower(CurrentSX1280Power);
     }
 #endif
