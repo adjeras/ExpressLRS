@@ -10,6 +10,8 @@ namespace
 {
 constexpr int PIN_X = 1;
 constexpr int PIN_Y = 2;
+constexpr int PIN_READY_SWITCH = 44;
+constexpr int PIN_STATUS_LED = 43;
 
 constexpr float EMA_ALPHA = 0.20f;
 constexpr float DEADBAND = 2.0f;
@@ -28,6 +30,12 @@ constexpr float STEERING_DECEL_RATE_MOVING = 120.0f;
 constexpr float MIN_STEERING_AUTHORITY = 30.0f;
 
 constexpr unsigned long DIAGNOSTIC_INTERVAL_MS = 100;
+constexpr unsigned long READY_SWITCH_DEBOUNCE_MS = 30;
+constexpr unsigned long INACTIVITY_LOCK_MS = 120000;
+constexpr uint8_t STATUS_LED_RED = 64;
+constexpr uint8_t STATUS_LED_GREEN = 64;
+constexpr uint8_t STATUS_LED_AMBER_RED = 64;
+constexpr uint8_t STATUS_LED_AMBER_GREEN = 32;
 
 float applyDeadband(float value)
 {
@@ -146,6 +154,9 @@ uint32_t mapDriveToCrsfChannel(float drive)
 
 void TorqueDollyHandset::Begin()
 {
+    pinMode(PIN_READY_SWITCH, INPUT_PULLUP);
+    neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, 0);
+
     analogReadResolution(12);
     analogSetPinAttenuation(PIN_X, ADC_11db);
     analogSetPinAttenuation(PIN_Y, ADC_11db);
@@ -185,26 +196,209 @@ void TorqueDollyHandset::handleInput()
             (1.0f - EMA_ALPHA) * yFiltered;
     }
 
-    float x = normalizeAxis(xFiltered, 400, 1600, 2860);
-    float y = normalizeAxis(yFiltered, 390, 1600, 2860);
+    float xNormalized = normalizeAxis(xFiltered, 400, 1600, 2860);
+    float yNormalized = normalizeAxis(yFiltered, 390, 1600, 2860);
 
-    x = applyDeadband(x);
-    y = applyDeadband(y);
+    float x = applyDeadband(xNormalized);
+    float y = applyDeadband(yNormalized);
 
     x = applyResponseCurve(x);
     y = applyResponseCurve(y);
 
+    enum class ReadyState
+    {
+        Locked,
+        Ready,
+        ControlledStop
+    };
+
+    static ReadyState readyState = ReadyState::Locked;
+    static bool switchInitialized = false;
+    static bool switchRawReady = false;
+    static bool switchStableReady = false;
+    static unsigned long switchChangedAt = 0;
+    static bool readyTransitionArmed = false;
+    static bool startupNeutral = true;
+    static unsigned long inactivityStartedAt = 0;
+    static bool inactivityLocked = false;
+
+    auto updateStatusLed = [](
+        ReadyState state,
+        bool isInactivityLocked,
+        unsigned long now
+    ) {
+        static bool initialized = false;
+        static ReadyState lastState;
+        static bool lastInactivityLocked = false;
+        static bool lastInactivityRed = false;
+
+        bool inactivityRed =
+            isInactivityLocked &&
+            state == ReadyState::Locked &&
+            now % 1000 < 100;
+
+        if (
+            initialized &&
+            state == lastState &&
+            isInactivityLocked == lastInactivityLocked &&
+            (!isInactivityLocked || inactivityRed == lastInactivityRed)
+        )
+        {
+            return;
+        }
+
+        initialized = true;
+        lastState = state;
+        lastInactivityLocked = isInactivityLocked;
+        lastInactivityRed = inactivityRed;
+
+        if (isInactivityLocked && state == ReadyState::Locked)
+        {
+            if (inactivityRed)
+            {
+                neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, 0);
+            }
+            else
+            {
+                neopixelWrite(PIN_STATUS_LED, 0, STATUS_LED_GREEN, 0);
+            }
+            return;
+        }
+
+        switch (state)
+        {
+            case ReadyState::Locked:
+                neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, 0);
+                break;
+            case ReadyState::Ready:
+                neopixelWrite(PIN_STATUS_LED, 0, STATUS_LED_GREEN, 0);
+                break;
+            case ReadyState::ControlledStop:
+                neopixelWrite(
+                    PIN_STATUS_LED,
+                    STATUS_LED_AMBER_RED,
+                    STATUS_LED_AMBER_GREEN,
+                    0
+                );
+                break;
+        }
+    };
+
+    bool switchReady = digitalRead(PIN_READY_SWITCH) == HIGH;
+    unsigned long nowMillis = millis();
+
+    if (!switchInitialized)
+    {
+        switchInitialized = true;
+        switchRawReady = switchReady;
+        switchStableReady = switchReady;
+        switchChangedAt = nowMillis;
+        readyTransitionArmed = !switchStableReady;
+    }
+    else if (switchReady != switchRawReady)
+    {
+        switchRawReady = switchReady;
+        switchChangedAt = nowMillis;
+    }
+    else if (
+        switchStableReady != switchRawReady &&
+        nowMillis - switchChangedAt >= READY_SWITCH_DEBOUNCE_MS
+    )
+    {
+        bool wasStableReady = switchStableReady;
+        switchStableReady = switchRawReady;
+
+        if (!switchStableReady)
+        {
+            inactivityLocked = false;
+
+            if (readyState == ReadyState::Ready)
+            {
+                readyState = ReadyState::ControlledStop;
+                readyTransitionArmed = false;
+            }
+            else if (readyState == ReadyState::Locked)
+            {
+                readyTransitionArmed = true;
+            }
+        }
+        else if (
+            !wasStableReady &&
+            readyState == ReadyState::Locked &&
+            readyTransitionArmed &&
+            fabs(xNormalized) <= DEADBAND &&
+            fabs(yNormalized) <= DEADBAND &&
+            !startupNeutral
+        )
+        {
+            readyState = ReadyState::Ready;
+            readyTransitionArmed = false;
+            inactivityLocked = false;
+            inactivityStartedAt = nowMillis;
+        }
+    }
+
     static float xDrive = 0.0f;
     static float yDrive = 0.0f;
     static unsigned long lastUpdate = millis();
-    unsigned long nowMillis = millis();
 
-    float dt = (nowMillis - lastUpdate) / 1000.0f;
-    lastUpdate = nowMillis;
+    unsigned long now = millis();
+    float dt = (now - lastUpdate) / 1000.0f;
+    lastUpdate = now;
 
     if (dt > 0.1f)
     {
         dt = 0.1f;
+    }
+
+    bool startupNeutralHold = startupNeutral;
+
+    if (startupNeutral)
+    {
+        if (
+            fabs(xNormalized) <= DEADBAND &&
+            fabs(yNormalized) <= DEADBAND
+        )
+        {
+            startupNeutral = false;
+            xDrive = 0.0f;
+            yDrive = 0.0f;
+            lastUpdate = now;
+        }
+    }
+
+    if (startupNeutralHold)
+    {
+        xDrive = 0.0f;
+        yDrive = 0.0f;
+    }
+
+    if (readyState == ReadyState::Ready)
+    {
+        bool joystickNeutral =
+            fabs(xNormalized) <= DEADBAND &&
+            fabs(yNormalized) <= DEADBAND;
+
+        if (!joystickNeutral)
+        {
+            inactivityStartedAt = now;
+        }
+        else if (
+            inactivityStartedAt != 0 &&
+            now - inactivityStartedAt >= INACTIVITY_LOCK_MS
+        )
+        {
+            readyState = ReadyState::Locked;
+            readyTransitionArmed = false;
+            inactivityLocked = true;
+            inactivityStartedAt = 0;
+        }
+    }
+
+    if (readyState != ReadyState::Ready)
+    {
+        x = 0.0f;
+        y = 0.0f;
     }
 
     float yDecelerationRate = DECEL_RATE_GENTLE;
@@ -235,13 +429,16 @@ void TorqueDollyHandset::handleInput()
             releaseFraction;
     }
 
-    yDrive = applySlewRate(
-        y,
-        yDrive,
-        dt,
-        ACCEL_RATE,
-        yDecelerationRate
-    );
+    if (!startupNeutralHold)
+    {
+        yDrive = applySlewRate(
+            y,
+            yDrive,
+            dt,
+            ACCEL_RATE,
+            yDecelerationRate
+        );
+    }
 
     float speedMagnitude = fabs(yDrive);
     float steeringRateBlend =
@@ -260,13 +457,32 @@ void TorqueDollyHandset::handleInput()
          STEERING_DECEL_RATE_STANDSTILL) *
         steeringRateBlend;
 
-    xDrive = applySlewRate(
-        x,
-        xDrive,
-        dt,
-        steeringAccelerationRate,
-        steeringDecelerationRate
-    );
+    if (!startupNeutralHold)
+    {
+        xDrive = applySlewRate(
+            x,
+            xDrive,
+            dt,
+            steeringAccelerationRate,
+            steeringDecelerationRate
+        );
+    }
+
+    if (
+        readyState == ReadyState::ControlledStop &&
+        fabs(xDrive) <= 0.0001f &&
+        fabs(yDrive) <= 0.0001f
+    )
+    {
+        xDrive = 0.0f;
+        yDrive = 0.0f;
+        readyState = ReadyState::Locked;
+        readyTransitionArmed = !switchStableReady;
+        inactivityLocked = false;
+        inactivityStartedAt = 0;
+    }
+
+    updateStatusLed(readyState, inactivityLocked, now);
 
     float lowSpeedSteeringLimit =
         speedMagnitude >= PIVOT_BLEND_END
@@ -316,9 +532,9 @@ void TorqueDollyHandset::handleInput()
     RCdataLastRecv = micros();
 
     static unsigned long lastDiagnostic = 0;
-    if (nowMillis - lastDiagnostic >= DIAGNOSTIC_INTERVAL_MS)
+    if (now - lastDiagnostic >= DIAGNOSTIC_INTERVAL_MS)
     {
-        lastDiagnostic = nowMillis;
+        lastDiagnostic = now;
         Serial.printf(
             "X_RAW: %4d Y_RAW: %4d X_FILTERED: %7.2f "
             "Y_FILTERED: %7.2f X_CMD: %7.2f%% X_DRIVE: %7.2f%% "
