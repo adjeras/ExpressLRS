@@ -3,39 +3,13 @@
 #if defined(PLATFORM_ESP32) && defined(TARGET_TX) && defined(TORQUE_DOLLY_HANDSET)
 
 #include "TorqueDollyHandset.h"
+#include "TorqueDollyControlParameters.h"
 #include "crsf_protocol.h"
 #include "common.h"
 
 namespace
 {
-constexpr int PIN_X = 1;
-constexpr int PIN_Y = 2;
-constexpr int PIN_READY_SWITCH = 44;
-constexpr int PIN_STATUS_LED = 43;
-
-constexpr float EMA_ALPHA = 0.20f;
-constexpr float DEADBAND = 2.0f;
-
-constexpr float ACCEL_RATE = 24.0f;
-constexpr float DECEL_RATE_GENTLE = 30.0f;
-constexpr float DECEL_RATE_STOP = 70.0f;
-
-constexpr float FULL_STEERING_AUTHORITY = 70.0f;
-constexpr float PIVOT_TURN_MAX = 40.0f;
-constexpr float PIVOT_BLEND_END = 40.0f;
-constexpr float STEERING_ACCEL_RATE_STANDSTILL = 200.0f;
-constexpr float STEERING_ACCEL_RATE_MOVING = 90.0f;
-constexpr float STEERING_DECEL_RATE_STANDSTILL = 50.0f;
-constexpr float STEERING_DECEL_RATE_MOVING = 120.0f;
-constexpr float MIN_STEERING_AUTHORITY = 30.0f;
-
-constexpr unsigned long DIAGNOSTIC_INTERVAL_MS = 100;
-constexpr unsigned long READY_SWITCH_DEBOUNCE_MS = 30;
-constexpr unsigned long INACTIVITY_LOCK_MS = 120000;
-constexpr uint8_t STATUS_LED_RED = 64;
-constexpr uint8_t STATUS_LED_GREEN = 64;
-constexpr uint8_t STATUS_LED_AMBER_RED = 64;
-constexpr uint8_t STATUS_LED_AMBER_GREEN = 32;
+using namespace TorqueDollyControlParameters;
 
 float applyDeadband(float value)
 {
@@ -46,38 +20,35 @@ float applyDeadband(float value)
 
     if (value > 0.0f)
     {
-        return (value - DEADBAND) * 100.0f / (100.0f - DEADBAND);
+        return (value - DEADBAND) * DRIVE_PERCENT_MAX /
+            (DRIVE_PERCENT_MAX - DEADBAND);
     }
 
-    return (value + DEADBAND) * 100.0f / (100.0f - DEADBAND);
+    return (value + DEADBAND) * DRIVE_PERCENT_MAX /
+        (DRIVE_PERCENT_MAX - DEADBAND);
 }
 
-float normalizeAxis(int raw, int minVal, int centerVal, int maxVal)
+float normalizeAxis(int raw, int minVal, float centerVal, int maxVal)
 {
     if (raw < centerVal)
     {
-        return -100.0f * (centerVal - raw) /
+        return DRIVE_PERCENT_MIN * (centerVal - raw) /
             static_cast<float>(centerVal - minVal);
     }
 
-    return 100.0f * (raw - centerVal) /
+    return DRIVE_PERCENT_MAX * (raw - centerVal) /
         static_cast<float>(maxVal - centerVal);
 }
 
 float applyResponseCurve(float value)
 {
-    static const float input[] = {
-        0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100
-    };
-
-    static const float output[] = {
-        0, 2, 6, 12, 20, 30, 42, 56, 70, 85, 100
-    };
+    const auto &input = RESPONSE_CURVE_INPUT;
+    const auto &output = RESPONSE_CURVE_OUTPUT;
 
     float sign = (value < 0.0f) ? -1.0f : 1.0f;
     float v = fabs(value);
 
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < RESPONSE_CURVE_SEGMENT_COUNT; i++)
     {
         if (v <= input[i + 1])
         {
@@ -91,7 +62,7 @@ float applyResponseCurve(float value)
         }
     }
 
-    return sign * 100.0f;
+    return sign * DRIVE_PERCENT_MAX;
 }
 
 float applySlewRate(
@@ -137,16 +108,21 @@ float applySlewRate(
 
 uint32_t mapDriveToCrsfChannel(float drive)
 {
-    drive = constrain(drive, -100.0f, 100.0f);
+    drive = constrain(
+        drive,
+        DRIVE_PERCENT_MIN,
+        DRIVE_PERCENT_MAX
+    );
 
     if (drive < 0.0f)
     {
-        const float fraction = (drive + 100.0f) / 100.0f;
+        const float fraction =
+            (drive - DRIVE_PERCENT_MIN) / DRIVE_PERCENT_RANGE;
         return static_cast<uint32_t>(CRSF_CHANNEL_VALUE_MIN +
             fraction * (CRSF_CHANNEL_VALUE_MID - CRSF_CHANNEL_VALUE_MIN));
     }
 
-    const float fraction = drive / 100.0f;
+    const float fraction = drive / DRIVE_PERCENT_RANGE;
     return static_cast<uint32_t>(CRSF_CHANNEL_VALUE_MID +
         fraction * (CRSF_CHANNEL_VALUE_MAX - CRSF_CHANNEL_VALUE_MID));
 }
@@ -157,9 +133,9 @@ void TorqueDollyHandset::Begin()
     pinMode(PIN_READY_SWITCH, INPUT_PULLUP);
     neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, 0);
 
-    analogReadResolution(12);
-    analogSetPinAttenuation(PIN_X, ADC_11db);
-    analogSetPinAttenuation(PIN_Y, ADC_11db);
+    analogReadResolution(ADC_RESOLUTION_BITS);
+    analogSetPinAttenuation(PIN_X, ADC_ATTENUATION);
+    analogSetPinAttenuation(PIN_Y, ADC_ATTENUATION);
 
     // Present a controller connection so the normal TX startup state machine
     // enables the RF scheduler without requiring an external CRSF handset.
@@ -175,35 +151,53 @@ void TorqueDollyHandset::End()
 
 void TorqueDollyHandset::handleInput()
 {
+    enum class StartupCalibrationState
+    {
+        Collecting,
+        RetryDelay,
+        Succeeded
+    };
+
+    static StartupCalibrationState calibrationState =
+        StartupCalibrationState::Collecting;
+    static unsigned long calibrationStartedAt = 0;
+    static unsigned long calibrationRetryStartedAt = 0;
+    static unsigned long calibrationSampleCount = 0;
+    static unsigned long calibrationValidSampleCount = 0;
+    static unsigned long calibrationInvalidSampleCount = 0;
+    static float calibrationXSum = 0.0f;
+    static float calibrationYSum = 0.0f;
+    static float calibrationXSumSquares = 0.0f;
+    static float calibrationYSumSquares = 0.0f;
+    static int calibrationXMin = 0;
+    static int calibrationXMax = 0;
+    static int calibrationYMin = 0;
+    static int calibrationYMax = 0;
+    static constexpr unsigned long calibrationWindowCount = 10;
+    static constexpr unsigned long calibrationWindowDurationMs = 50;
+    static unsigned long calibrationWindowIndex = 0;
+    static unsigned long calibrationWindowDuration[calibrationWindowCount] = {};
+    static unsigned long calibrationWindowValidSamples[calibrationWindowCount] = {};
+    static unsigned long calibrationWindowInvalidSamples[calibrationWindowCount] = {};
+    static float calibrationWindowXSum[calibrationWindowCount] = {};
+    static float calibrationWindowYSum[calibrationWindowCount] = {};
+    static float calibrationWindowXSumSquares[calibrationWindowCount] = {};
+    static float calibrationWindowYSumSquares[calibrationWindowCount] = {};
+    static int calibrationWindowXMin[calibrationWindowCount] = {};
+    static int calibrationWindowXMax[calibrationWindowCount] = {};
+    static int calibrationWindowYMin[calibrationWindowCount] = {};
+    static int calibrationWindowYMax[calibrationWindowCount] = {};
+    static bool calibrationWindowComplete[calibrationWindowCount] = {};
+    static float runtimeXCenter = X_CENTER;
+    static float runtimeYCenter = Y_CENTER;
+
     int xRaw = analogRead(PIN_X);
     int yRaw = analogRead(PIN_Y);
+    unsigned long now = millis();
 
     static bool filterInitialized = false;
     static float xFiltered = 0.0f;
     static float yFiltered = 0.0f;
-
-    if (!filterInitialized)
-    {
-        xFiltered = xRaw;
-        yFiltered = yRaw;
-        filterInitialized = true;
-    }
-    else
-    {
-        xFiltered = EMA_ALPHA * xRaw +
-            (1.0f - EMA_ALPHA) * xFiltered;
-        yFiltered = EMA_ALPHA * yRaw +
-            (1.0f - EMA_ALPHA) * yFiltered;
-    }
-
-    float xNormalized = normalizeAxis(xFiltered, 400, 1600, 2860);
-    float yNormalized = normalizeAxis(yFiltered, 390, 1600, 2860);
-
-    float x = applyDeadband(xNormalized);
-    float y = applyDeadband(yNormalized);
-
-    x = applyResponseCurve(x);
-    y = applyResponseCurve(y);
 
     enum class ReadyState
     {
@@ -220,28 +214,66 @@ void TorqueDollyHandset::handleInput()
     static bool readyTransitionArmed = false;
     static bool startupNeutral = true;
     static unsigned long inactivityStartedAt = 0;
+    static unsigned long activityQualificationStartedAt = 0;
+    static unsigned long inactivityResetCount = 0;
     static bool inactivityLocked = false;
+#if defined(TORQUE_DOLLY_INACTIVITY_VISUAL_DIAGNOSTICS)
+    static unsigned long magentaVisibleUntil = 0;
+#endif
+
+    if (!filterInitialized)
+    {
+        xFiltered = xRaw;
+        yFiltered = yRaw;
+        filterInitialized = true;
+    }
+    else
+    {
+        xFiltered = EMA_ALPHA * xRaw +
+            (1.0f - EMA_ALPHA) * xFiltered;
+        yFiltered = EMA_ALPHA * yRaw +
+            (1.0f - EMA_ALPHA) * yFiltered;
+    }
+
+    float xNormalized = normalizeAxis(
+        xFiltered, X_MIN, runtimeXCenter, X_MAX);
+    float yNormalized = normalizeAxis(
+        yFiltered, Y_MIN, runtimeYCenter, Y_MAX);
+
+    float x = applyDeadband(xNormalized);
+    float y = applyDeadband(yNormalized);
+
+    x = applyResponseCurve(x);
+    y = applyResponseCurve(y);
 
     auto updateStatusLed = [](
         ReadyState state,
         bool isInactivityLocked,
-        unsigned long now
+        unsigned long now,
+        bool visualDiagnosticActive,
+        bool calibrationComplete,
+        bool calibrationFailed
     ) {
         static bool initialized = false;
         static ReadyState lastState;
         static bool lastInactivityLocked = false;
         static bool lastInactivityRed = false;
+        static bool lastVisualDiagnosticActive = false;
+        static bool lastCalibrationComplete = false;
+        static bool lastCalibrationFailed = false;
 
         bool inactivityRed =
             isInactivityLocked &&
             state == ReadyState::Locked &&
-            now % 1000 < 100;
+            now % INACTIVITY_BLINK_PERIOD_MS < INACTIVITY_BLINK_RED_MS;
 
         if (
             initialized &&
+            calibrationComplete &&
             state == lastState &&
             isInactivityLocked == lastInactivityLocked &&
-            (!isInactivityLocked || inactivityRed == lastInactivityRed)
+            (!isInactivityLocked || inactivityRed == lastInactivityRed) &&
+            visualDiagnosticActive == lastVisualDiagnosticActive
         )
         {
             return;
@@ -251,6 +283,37 @@ void TorqueDollyHandset::handleInput()
         lastState = state;
         lastInactivityLocked = isInactivityLocked;
         lastInactivityRed = inactivityRed;
+        lastVisualDiagnosticActive = visualDiagnosticActive;
+        lastCalibrationComplete = calibrationComplete;
+        lastCalibrationFailed = calibrationFailed;
+
+        if (!calibrationComplete)
+        {
+            if (calibrationFailed)
+            {
+                bool failureRed =
+                    now % CALIBRATION_FAILURE_BLINK_PERIOD_MS <
+                    CALIBRATION_FAILURE_RED_MS;
+                if (failureRed)
+                {
+                    neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, 0);
+                }
+                else
+                {
+                    neopixelWrite(PIN_STATUS_LED, 0, 0, 0);
+                }
+            }
+            else
+            {
+                neopixelWrite(
+                    PIN_STATUS_LED,
+                    0,
+                    0,
+                    STATUS_LED_CALIBRATION_BLUE
+                );
+            }
+            return;
+        }
 
         if (isInactivityLocked && state == ReadyState::Locked)
         {
@@ -264,6 +327,14 @@ void TorqueDollyHandset::handleInput()
             }
             return;
         }
+
+#if defined(TORQUE_DOLLY_INACTIVITY_VISUAL_DIAGNOSTICS)
+        if (state == ReadyState::Ready && visualDiagnosticActive)
+        {
+            neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, STATUS_LED_RED);
+            return;
+        }
+#endif
 
         switch (state)
         {
@@ -285,7 +356,398 @@ void TorqueDollyHandset::handleInput()
     };
 
     bool switchReady = digitalRead(PIN_READY_SWITCH) == HIGH;
-    unsigned long nowMillis = millis();
+    unsigned long nowMillis = now;
+    bool calibrationWasComplete =
+        calibrationState == StartupCalibrationState::Succeeded;
+
+    if (calibrationState == StartupCalibrationState::Collecting)
+    {
+        if (calibrationStartedAt == 0)
+        {
+            calibrationStartedAt = now;
+            calibrationXMin = xRaw;
+            calibrationXMax = xRaw;
+            calibrationYMin = yRaw;
+            calibrationYMax = yRaw;
+            calibrationWindowIndex = 0;
+            for (unsigned long i = 0; i < calibrationWindowCount; i++)
+            {
+                calibrationWindowDuration[i] = 0;
+                calibrationWindowValidSamples[i] = 0;
+                calibrationWindowInvalidSamples[i] = 0;
+                calibrationWindowXSum[i] = 0.0f;
+                calibrationWindowYSum[i] = 0.0f;
+                calibrationWindowXSumSquares[i] = 0.0f;
+                calibrationWindowYSumSquares[i] = 0.0f;
+                calibrationWindowXMin[i] = 4095;
+                calibrationWindowXMax[i] = 0;
+                calibrationWindowYMin[i] = 4095;
+                calibrationWindowYMax[i] = 0;
+                calibrationWindowComplete[i] = false;
+            }
+        }
+
+        unsigned long calibrationElapsed = now - calibrationStartedAt;
+        unsigned long sampleWindowIndex = min(
+            calibrationElapsed / calibrationWindowDurationMs,
+            calibrationWindowCount - 1
+        );
+        while (calibrationWindowIndex < sampleWindowIndex)
+        {
+            calibrationWindowDuration[calibrationWindowIndex] =
+                calibrationWindowDurationMs;
+            calibrationWindowComplete[calibrationWindowIndex] = true;
+            calibrationWindowIndex++;
+        }
+
+        calibrationSampleCount++;
+        bool validSample =
+            xRaw >= 0 && xRaw <= 4095 &&
+            yRaw >= 0 && yRaw <= 4095;
+
+        if (validSample)
+        {
+            calibrationValidSampleCount++;
+            calibrationXSum += xRaw;
+            calibrationYSum += yRaw;
+            calibrationXSumSquares +=
+                static_cast<float>(xRaw) * xRaw;
+            calibrationYSumSquares +=
+                static_cast<float>(yRaw) * yRaw;
+            calibrationXMin = min(calibrationXMin, xRaw);
+            calibrationXMax = max(calibrationXMax, xRaw);
+            calibrationYMin = min(calibrationYMin, yRaw);
+            calibrationYMax = max(calibrationYMax, yRaw);
+
+            calibrationWindowValidSamples[sampleWindowIndex]++;
+            calibrationWindowXSum[sampleWindowIndex] += xRaw;
+            calibrationWindowYSum[sampleWindowIndex] += yRaw;
+            calibrationWindowXSumSquares[sampleWindowIndex] +=
+                static_cast<float>(xRaw) * xRaw;
+            calibrationWindowYSumSquares[sampleWindowIndex] +=
+                static_cast<float>(yRaw) * yRaw;
+            calibrationWindowXMin[sampleWindowIndex] = min(
+                calibrationWindowXMin[sampleWindowIndex], xRaw);
+            calibrationWindowXMax[sampleWindowIndex] = max(
+                calibrationWindowXMax[sampleWindowIndex], xRaw);
+            calibrationWindowYMin[sampleWindowIndex] = min(
+                calibrationWindowYMin[sampleWindowIndex], yRaw);
+            calibrationWindowYMax[sampleWindowIndex] = max(
+                calibrationWindowYMax[sampleWindowIndex], yRaw);
+        }
+        else
+        {
+            calibrationInvalidSampleCount++;
+            calibrationWindowInvalidSamples[sampleWindowIndex]++;
+        }
+
+        if (now - calibrationStartedAt >= STARTUP_CALIBRATION_DURATION_MS)
+        {
+            if (calibrationWindowIndex < calibrationWindowCount)
+            {
+                calibrationWindowDuration[calibrationWindowIndex] =
+                    calibrationElapsed -
+                    calibrationWindowIndex * calibrationWindowDurationMs;
+                calibrationWindowComplete[calibrationWindowIndex] = true;
+            }
+
+            unsigned long completeWindowCount = 0;
+            unsigned long sampledWindowCount = 0;
+            float windowMeanX[calibrationWindowCount] = {};
+            float windowMeanY[calibrationWindowCount] = {};
+            float maxWindowMeanSpanX = 0.0f;
+            float maxWindowMeanSpanY = 0.0f;
+            float firstToLastDriftX = 0.0f;
+            float firstToLastDriftY = 0.0f;
+            float maxAdjacentStepX = 0.0f;
+            float maxAdjacentStepY = 0.0f;
+
+            for (unsigned long i = 0; i < calibrationWindowCount; i++)
+            {
+                if (calibrationWindowComplete[i])
+                {
+                    completeWindowCount++;
+                }
+                if (calibrationWindowValidSamples[i] > 0)
+                {
+                    sampledWindowCount++;
+                    windowMeanX[i] = calibrationWindowXSum[i] /
+                        calibrationWindowValidSamples[i];
+                    windowMeanY[i] = calibrationWindowYSum[i] /
+                        calibrationWindowValidSamples[i];
+                }
+            }
+
+            bool allWindowsSampled =
+                completeWindowCount == calibrationWindowCount &&
+                sampledWindowCount == calibrationWindowCount;
+            if (allWindowsSampled)
+            {
+                float minWindowMeanX = windowMeanX[0];
+                float maxWindowMeanX = windowMeanX[0];
+                float minWindowMeanY = windowMeanY[0];
+                float maxWindowMeanY = windowMeanY[0];
+                for (unsigned long i = 1; i < calibrationWindowCount; i++)
+                {
+                    minWindowMeanX = min(minWindowMeanX, windowMeanX[i]);
+                    maxWindowMeanX = max(maxWindowMeanX, windowMeanX[i]);
+                    minWindowMeanY = min(minWindowMeanY, windowMeanY[i]);
+                    maxWindowMeanY = max(maxWindowMeanY, windowMeanY[i]);
+                    maxAdjacentStepX = max(
+                        maxAdjacentStepX,
+                        fabs(windowMeanX[i] - windowMeanX[i - 1])
+                    );
+                    maxAdjacentStepY = max(
+                        maxAdjacentStepY,
+                        fabs(windowMeanY[i] - windowMeanY[i - 1])
+                    );
+                }
+                maxWindowMeanSpanX = maxWindowMeanX - minWindowMeanX;
+                maxWindowMeanSpanY = maxWindowMeanY - minWindowMeanY;
+                firstToLastDriftX = fabs(
+                    windowMeanX[calibrationWindowCount - 1] -
+                    windowMeanX[0]
+                );
+                firstToLastDriftY = fabs(
+                    windowMeanY[calibrationWindowCount - 1] -
+                    windowMeanY[0]
+                );
+            }
+
+            Serial.printf(
+                "CALIBRATION_WINDOWS complete=%lu/%lu sampled=%lu/%lu "
+                "span=(%.2f,%.2f) drift=(%.2f,%.2f) "
+                "maxstep=(%.2f,%.2f)\n",
+                completeWindowCount,
+                calibrationWindowCount,
+                sampledWindowCount,
+                calibrationWindowCount,
+                maxWindowMeanSpanX,
+                maxWindowMeanSpanY,
+                firstToLastDriftX,
+                firstToLastDriftY,
+                maxAdjacentStepX,
+                maxAdjacentStepY
+            );
+            for (unsigned long i = 0; i < calibrationWindowCount; i++)
+            {
+                unsigned long validSamples =
+                    calibrationWindowValidSamples[i];
+                float meanX = validSamples > 0
+                    ? calibrationWindowXSum[i] / validSamples : 0.0f;
+                float meanY = validSamples > 0
+                    ? calibrationWindowYSum[i] / validSamples : 0.0f;
+                float varianceX = validSamples > 0
+                    ? calibrationWindowXSumSquares[i] / validSamples -
+                        meanX * meanX : 0.0f;
+                float varianceY = validSamples > 0
+                    ? calibrationWindowYSumSquares[i] / validSamples -
+                        meanY * meanY : 0.0f;
+                Serial.printf(
+                    "CALIBRATION_WINDOW %lu duration=%lu valid=%lu "
+                    "invalid=%lu mean=(%.2f,%.2f) stddev=(%.2f,%.2f) "
+                    "min=(%d,%d) max=(%d,%d)\n",
+                    i,
+                    calibrationWindowDuration[i],
+                    validSamples,
+                    calibrationWindowInvalidSamples[i],
+                    meanX,
+                    meanY,
+                    sqrtf(max(0.0f, varianceX)),
+                    sqrtf(max(0.0f, varianceY)),
+                    validSamples > 0 ? calibrationWindowXMin[i] : 0,
+                    validSamples > 0 ? calibrationWindowYMin[i] : 0,
+                    validSamples > 0 ? calibrationWindowXMax[i] : 0,
+                    validSamples > 0 ? calibrationWindowYMax[i] : 0
+                );
+            }
+
+            constexpr unsigned long minWindowSamples = 5;
+            constexpr float maxWindowStdDev = 24.0f;
+            constexpr float maxWindowMeanSpan = 24.0f;
+            constexpr float maxWindowDrift = 16.0f;
+            constexpr float maxWindowStep = 12.0f;
+
+            bool enoughSamples =
+                calibrationValidSampleCount >=
+                STARTUP_CALIBRATION_MIN_SAMPLES;
+            bool invalidRateAcceptable =
+                calibrationInvalidSampleCount * 10 <=
+                calibrationSampleCount;
+            bool windowsComplete = completeWindowCount ==
+                calibrationWindowCount;
+            bool windowsSampled = sampledWindowCount ==
+                calibrationWindowCount;
+            bool windowsEnoughSamples = windowsComplete && windowsSampled;
+            bool windowsFinite = windowsEnoughSamples;
+            bool windowsCenterPlausible = windowsEnoughSamples;
+            bool windowsStdDevAcceptable = windowsEnoughSamples;
+
+            float xMeansForMedian[calibrationWindowCount] = {};
+            float yMeansForMedian[calibrationWindowCount] = {};
+            for (unsigned long i = 0; i < calibrationWindowCount; i++)
+            {
+                unsigned long validSamples =
+                    calibrationWindowValidSamples[i];
+                if (validSamples < minWindowSamples)
+                {
+                    windowsEnoughSamples = false;
+                    continue;
+                }
+
+                float meanX = calibrationWindowXSum[i] / validSamples;
+                float meanY = calibrationWindowYSum[i] / validSamples;
+                float varianceX =
+                    calibrationWindowXSumSquares[i] / validSamples -
+                    meanX * meanX;
+                float varianceY =
+                    calibrationWindowYSumSquares[i] / validSamples -
+                    meanY * meanY;
+                float stdDevX = sqrtf(max(0.0f, varianceX));
+                float stdDevY = sqrtf(max(0.0f, varianceY));
+
+                if (!isfinite(meanX) || !isfinite(meanY) ||
+                    !isfinite(stdDevX) || !isfinite(stdDevY))
+                {
+                    windowsFinite = false;
+                }
+                if (
+                    fabs(meanX - X_CENTER) >
+                        STARTUP_CALIBRATION_CENTER_WINDOW_RAW ||
+                    fabs(meanY - Y_CENTER) >
+                        STARTUP_CALIBRATION_CENTER_WINDOW_RAW
+                )
+                {
+                    windowsCenterPlausible = false;
+                }
+                if (stdDevX > maxWindowStdDev ||
+                    stdDevY > maxWindowStdDev)
+                {
+                    windowsStdDevAcceptable = false;
+                }
+
+                xMeansForMedian[i] = meanX;
+                yMeansForMedian[i] = meanY;
+            }
+
+            bool windowMeansStable = windowsEnoughSamples && windowsFinite &&
+                windowsCenterPlausible && windowsStdDevAcceptable;
+
+            bool windowSpanAcceptable =
+                windowMeansStable &&
+                maxWindowMeanSpanX <= maxWindowMeanSpan &&
+                maxWindowMeanSpanY <= maxWindowMeanSpan;
+            bool windowDriftAcceptable =
+                windowMeansStable &&
+                firstToLastDriftX <= maxWindowDrift &&
+                firstToLastDriftY <= maxWindowDrift;
+            bool windowStepAcceptable =
+                windowMeansStable &&
+                maxAdjacentStepX <= maxWindowStep &&
+                maxAdjacentStepY <= maxWindowStep;
+
+            float xMean = 0.0f;
+            float yMean = 0.0f;
+            if (windowMeansStable)
+            {
+                for (unsigned long i = 0; i < calibrationWindowCount; i++)
+                {
+                    for (unsigned long j = i + 1;
+                         j < calibrationWindowCount; j++)
+                    {
+                        if (xMeansForMedian[j] < xMeansForMedian[i])
+                        {
+                            float value = xMeansForMedian[i];
+                            xMeansForMedian[i] = xMeansForMedian[j];
+                            xMeansForMedian[j] = value;
+                        }
+                        if (yMeansForMedian[j] < yMeansForMedian[i])
+                        {
+                            float value = yMeansForMedian[i];
+                            yMeansForMedian[i] = yMeansForMedian[j];
+                            yMeansForMedian[j] = value;
+                        }
+                    }
+                }
+                xMean = (xMeansForMedian[4] + xMeansForMedian[5]) / 2.0f;
+                yMean = (yMeansForMedian[4] + yMeansForMedian[5]) / 2.0f;
+            }
+
+            bool finalCenterPlausible =
+                windowMeansStable &&
+                isfinite(xMean) && isfinite(yMean) &&
+                fabs(xMean - X_CENTER) <=
+                    STARTUP_CALIBRATION_CENTER_WINDOW_RAW &&
+                fabs(yMean - Y_CENTER) <=
+                    STARTUP_CALIBRATION_CENTER_WINDOW_RAW;
+            bool calibrationAccepted =
+                enoughSamples && invalidRateAcceptable &&
+                windowsComplete && windowsSampled && windowsEnoughSamples &&
+                windowsFinite && windowsCenterPlausible &&
+                windowsStdDevAcceptable && windowSpanAcceptable &&
+                windowDriftAcceptable && windowStepAcceptable &&
+                finalCenterPlausible;
+
+            Serial.printf(
+                "CALIBRATION %s samples=%lu invalid=%lu "
+                "mean=(%.2f,%.2f) windows="
+                "samples:%s invalid:%s center:%s stddev:%s "
+                "span:%s drift:%s step:%s finite:%s complete:%s\n",
+                calibrationAccepted ? "SUCCESS" : "FAILED",
+                calibrationSampleCount,
+                calibrationInvalidSampleCount,
+                xMean,
+                yMean,
+                enoughSamples ? "PASS" : "FAIL",
+                invalidRateAcceptable ? "PASS" : "FAIL",
+                finalCenterPlausible ? "PASS" : "FAIL",
+                windowsStdDevAcceptable ? "PASS" : "FAIL",
+                windowSpanAcceptable ? "PASS" : "FAIL",
+                windowDriftAcceptable ? "PASS" : "FAIL",
+                windowStepAcceptable ? "PASS" : "FAIL",
+                windowsFinite ? "PASS" : "FAIL",
+                windowsComplete && windowsSampled &&
+                        windowsEnoughSamples ? "PASS" : "FAIL"
+            );
+
+            if (calibrationAccepted)
+            {
+                runtimeXCenter = xMean;
+                runtimeYCenter = yMean;
+                xFiltered = runtimeXCenter;
+                yFiltered = runtimeYCenter;
+                filterInitialized = true;
+                calibrationState = StartupCalibrationState::Succeeded;
+                startupNeutral = true;
+                inactivityStartedAt = 0;
+                activityQualificationStartedAt = 0;
+                inactivityLocked = false;
+                readyTransitionArmed = false;
+            }
+            else
+            {
+                calibrationState = StartupCalibrationState::RetryDelay;
+                calibrationRetryStartedAt = now;
+            }
+        }
+    }
+    else if (
+        calibrationState == StartupCalibrationState::RetryDelay &&
+        now - calibrationRetryStartedAt >=
+            STARTUP_CALIBRATION_RETRY_DELAY_MS
+    )
+    {
+        calibrationState = StartupCalibrationState::Collecting;
+        calibrationStartedAt = 0;
+        calibrationWindowIndex = 0;
+        calibrationSampleCount = 0;
+        calibrationValidSampleCount = 0;
+        calibrationInvalidSampleCount = 0;
+        calibrationXSum = 0.0f;
+        calibrationYSum = 0.0f;
+        calibrationXSumSquares = 0.0f;
+        calibrationYSumSquares = 0.0f;
+    }
 
     if (!switchInitialized)
     {
@@ -310,6 +772,7 @@ void TorqueDollyHandset::handleInput()
 
         if (!switchStableReady)
         {
+            activityQualificationStartedAt = 0;
             inactivityLocked = false;
 
             if (readyState == ReadyState::Ready)
@@ -325,6 +788,8 @@ void TorqueDollyHandset::handleInput()
         else if (
             !wasStableReady &&
             readyState == ReadyState::Locked &&
+            calibrationState == StartupCalibrationState::Succeeded &&
+            calibrationWasComplete &&
             readyTransitionArmed &&
             fabs(xNormalized) <= DEADBAND &&
             fabs(yNormalized) <= DEADBAND &&
@@ -333,6 +798,7 @@ void TorqueDollyHandset::handleInput()
         {
             readyState = ReadyState::Ready;
             readyTransitionArmed = false;
+            activityQualificationStartedAt = 0;
             inactivityLocked = false;
             inactivityStartedAt = nowMillis;
         }
@@ -342,13 +808,22 @@ void TorqueDollyHandset::handleInput()
     static float yDrive = 0.0f;
     static unsigned long lastUpdate = millis();
 
-    unsigned long now = millis();
+    // A transition debounced during calibration is not eligible. Once the
+    // calibration-completion call has finished, a currently Locked switch
+    // position can arm the next deliberate Locked-to-Ready transition.
+    if (!calibrationWasComplete &&
+        calibrationState == StartupCalibrationState::Succeeded &&
+        !switchStableReady)
+    {
+        readyTransitionArmed = true;
+    }
+
     float dt = (now - lastUpdate) / 1000.0f;
     lastUpdate = now;
 
-    if (dt > 0.1f)
+    if (dt > MAX_CONTROL_DT_SECONDS)
     {
-        dt = 0.1f;
+        dt = MAX_CONTROL_DT_SECONDS;
     }
 
     bool startupNeutralHold = startupNeutral;
@@ -373,25 +848,58 @@ void TorqueDollyHandset::handleInput()
         yDrive = 0.0f;
     }
 
-    if (readyState == ReadyState::Ready)
-    {
-        bool joystickNeutral =
-            fabs(xNormalized) <= DEADBAND &&
-            fabs(yNormalized) <= DEADBAND;
+    bool joystickNeutral =
+        fabs(xNormalized) <= DEADBAND &&
+        fabs(yNormalized) <= DEADBAND;
 
+#if defined(TORQUE_DOLLY_INACTIVITY_VISUAL_DIAGNOSTICS)
+    if (readyState == ReadyState::Ready &&
+        calibrationState == StartupCalibrationState::Succeeded &&
+        !joystickNeutral)
+    {
+        magentaVisibleUntil = now;
+    }
+
+    bool visualDiagnosticActive =
+        readyState == ReadyState::Ready &&
+        now - magentaVisibleUntil < 1000;
+#else
+    bool visualDiagnosticActive = false;
+#endif
+
+    if (readyState == ReadyState::Ready &&
+        calibrationState == StartupCalibrationState::Succeeded)
+    {
         if (!joystickNeutral)
         {
-            inactivityStartedAt = now;
+            if (activityQualificationStartedAt == 0)
+            {
+                activityQualificationStartedAt = now;
+            }
+            else if (
+                now - activityQualificationStartedAt >=
+                    ACTIVITY_QUALIFICATION_MS
+            )
+            {
+                inactivityStartedAt = now;
+                inactivityResetCount++;
+                activityQualificationStartedAt = 0;
+            }
         }
-        else if (
+        else
+        {
+            activityQualificationStartedAt = 0;
+        }
+
+        if (joystickNeutral &&
             inactivityStartedAt != 0 &&
-            now - inactivityStartedAt >= INACTIVITY_LOCK_MS
-        )
+            now - inactivityStartedAt >= INACTIVITY_LOCK_MS)
         {
             readyState = ReadyState::Locked;
             readyTransitionArmed = false;
             inactivityLocked = true;
             inactivityStartedAt = 0;
+            activityQualificationStartedAt = 0;
         }
     }
 
@@ -399,6 +907,14 @@ void TorqueDollyHandset::handleInput()
     {
         x = 0.0f;
         y = 0.0f;
+    }
+
+    if (calibrationState != StartupCalibrationState::Succeeded)
+    {
+        x = 0.0f;
+        y = 0.0f;
+        xDrive = 0.0f;
+        yDrive = 0.0f;
     }
 
     float yDecelerationRate = DECEL_RATE_GENTLE;
@@ -480,9 +996,17 @@ void TorqueDollyHandset::handleInput()
         readyTransitionArmed = !switchStableReady;
         inactivityLocked = false;
         inactivityStartedAt = 0;
+        activityQualificationStartedAt = 0;
     }
 
-    updateStatusLed(readyState, inactivityLocked, now);
+    updateStatusLed(
+        readyState,
+        inactivityLocked,
+        now,
+        visualDiagnosticActive,
+        calibrationState == StartupCalibrationState::Succeeded,
+        calibrationState == StartupCalibrationState::RetryDelay
+    );
 
     float lowSpeedSteeringLimit =
         speedMagnitude >= PIVOT_BLEND_END
@@ -494,7 +1018,7 @@ void TorqueDollyHandset::handleInput()
     float highSpeedSteeringAuthority =
         FULL_STEERING_AUTHORITY -
         (FULL_STEERING_AUTHORITY - MIN_STEERING_AUTHORITY) *
-        (speedMagnitude / 100.0f);
+        (speedMagnitude / DRIVE_PERCENT_RANGE);
 
     float steeringAuthority = min(
         lowSpeedSteeringLimit,
@@ -502,7 +1026,7 @@ void TorqueDollyHandset::handleInput()
     );
 
     float effectiveX =
-        xDrive * steeringAuthority / 100.0f;
+        xDrive * steeringAuthority / DRIVE_PERCENT_RANGE;
 
     float leftDrive = yDrive + effectiveX;
     float rightDrive = yDrive - effectiveX;
@@ -512,9 +1036,9 @@ void TorqueDollyHandset::handleInput()
         fabs(rightDrive)
     );
 
-    if (maxMixedMagnitude > 100.0f)
+    if (maxMixedMagnitude > DRIVE_PERCENT_MAX)
     {
-        float scale = 100.0f / maxMixedMagnitude;
+        float scale = DRIVE_PERCENT_MAX / maxMixedMagnitude;
         leftDrive *= scale;
         rightDrive *= scale;
     }
@@ -557,6 +1081,43 @@ void TorqueDollyHandset::handleInput()
             static_cast<unsigned long>(rightChannel)
         );
     }
+
+#if defined(TORQUE_DOLLY_INACTIVITY_DIAGNOSTICS)
+    static unsigned long lastInactivityDiagnostic = 0;
+    if (now - lastInactivityDiagnostic >= 1000)
+    {
+        lastInactivityDiagnostic = now;
+
+        const char *stateName = "Locked";
+        if (readyState == ReadyState::Ready)
+        {
+            stateName = "Ready";
+        }
+        else if (readyState == ReadyState::ControlledStop)
+        {
+            stateName = "ControlledStop";
+        }
+
+        unsigned long elapsedSinceReset =
+            inactivityStartedAt == 0 ? 0 : now - inactivityStartedAt;
+
+        Serial.printf(
+            "INACTIVITY_DIAG X_FILTERED: %7.2f Y_FILTERED: %7.2f "
+            "X_NORMALIZED: %7.2f%% Y_NORMALIZED: %7.2f%% "
+            "NEUTRAL: %s ELAPSED_MS: %lu RESETS: %lu "
+            "STATE: %s INACTIVITY_LOCKED: %s\n",
+            xFiltered,
+            yFiltered,
+            xNormalized,
+            yNormalized,
+            joystickNeutral ? "yes" : "no",
+            elapsedSinceReset,
+            inactivityResetCount,
+            stateName,
+            inactivityLocked ? "yes" : "no"
+        );
+    }
+#endif
 }
 
 #endif
