@@ -6,6 +6,15 @@
 #include "TorqueDollyControlParameters.h"
 #include "crsf_protocol.h"
 #include "common.h"
+#include "timingDiagnostics.h"
+
+#if defined(TORQUE_DOLLY_BLE_TELEMETRY)
+namespace
+{
+portMUX_TYPE diagnosticStateMux = portMUX_INITIALIZER_UNLOCKED;
+TorqueDollyDiagnosticState diagnosticState = TorqueDollyDiagnosticState::Locked;
+}
+#endif
 
 namespace
 {
@@ -151,6 +160,8 @@ void TorqueDollyHandset::End()
 
 void TorqueDollyHandset::handleInput()
 {
+    timingDiagnosticsRecordJoystickHandler();
+
     enum class StartupCalibrationState
     {
         Collecting,
@@ -1118,6 +1129,37 @@ void TorqueDollyHandset::handleInput()
         );
     }
 #endif
+
+#if defined(TORQUE_DOLLY_BLE_TELEMETRY)
+    TorqueDollyDiagnosticState publishedState =
+        TorqueDollyDiagnosticState::Locked;
+    switch (readyState)
+    {
+        case ReadyState::Locked:
+            publishedState = TorqueDollyDiagnosticState::Locked;
+            break;
+        case ReadyState::Ready:
+            publishedState = TorqueDollyDiagnosticState::Ready;
+            break;
+        case ReadyState::ControlledStop:
+            publishedState = TorqueDollyDiagnosticState::ControlledStop;
+            break;
+    }
+
+    portENTER_CRITICAL(&diagnosticStateMux);
+    diagnosticState = publishedState;
+    portEXIT_CRITICAL(&diagnosticStateMux);
+#endif
 }
+
+#if defined(TORQUE_DOLLY_BLE_TELEMETRY)
+TorqueDollyDiagnosticState TorqueDollyHandset::getDiagnosticState()
+{
+    portENTER_CRITICAL(&diagnosticStateMux);
+    TorqueDollyDiagnosticState state = diagnosticState;
+    portEXIT_CRITICAL(&diagnosticStateMux);
+    return state;
+}
+#endif
 
 #endif

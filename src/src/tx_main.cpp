@@ -1,4 +1,5 @@
 #include "rxtx_common.h"
+#include "timingDiagnostics.h"
 
 #include "CRSFHandset.h"
 #include "dynpower.h"
@@ -15,6 +16,9 @@
 #include "devScreen.h"
 #include "devBuzzer.h"
 #include "devBLE.h"
+#if defined(TORQUE_DOLLY_BLE_TELEMETRY) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+#include "devTorqueDollyBLE.h"
+#endif
 #include "devLUA.h"
 #include "devWIFI.h"
 #include "devButton.h"
@@ -109,7 +113,9 @@ device_affinity_t ui_devices[] = {
 #if defined(USE_TX_BACKPACK)
   {&Backpack_device, 0},
 #endif
-#ifdef HAS_BLE
+#if defined(TORQUE_DOLLY_BLE_TELEMETRY) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+  {&TorqueDollyBLE_device, 0},
+#elif defined(HAS_BLE)
   {&BLE_device, 0},
 #endif
 #ifdef HAS_BUZZER
@@ -397,6 +403,7 @@ void SetRFLinkRate(uint8_t index) // Set speed of RF link
   interval = interval * 12 / 10; // increase the packet interval by 20% to allow adding packet header
 #endif
   hwTimer::updateInterval(interval);
+  timingDiagnosticsSetExpectedInterval(interval);
 
   FHSSusePrimaryFreqBand = !(ModParams->radio_type == RADIO_TYPE_LR1121_LORA_2G4) && !(ModParams->radio_type == RADIO_TYPE_LR1121_GFSK_2G4);
   FHSSuseDualBand = ModParams->radio_type == RADIO_TYPE_LR1121_LORA_DUAL;
@@ -639,6 +646,8 @@ void ICACHE_RAM_ATTR nonceAdvance()
  */
 void ICACHE_RAM_ATTR timerCallback()
 {
+  timingDiagnosticsRecordTimerCallback();
+
   /* If we are busy writing to EEPROM (committing config changes) then we just advance the nonces, i.e. no SPI traffic */
   if (commitInProgress)
   {
@@ -1427,6 +1436,7 @@ void setup()
     handset->registerCallbacks(UARTconnected, firmwareOptions.is_airport ? nullptr : UARTdisconnected, ModelUpdateReq, EnterBindingModeSafely);
 
     DBGLN("ExpressLRS TX Module Booted...");
+    timingDiagnosticsInit();
 
     eeprom.Begin(); // Init the eeprom
     config.SetStorageProvider(&eeprom); // Pass pointer to the Config class for access to storage
@@ -1496,6 +1506,7 @@ void setup()
 void loop()
 {
   uint32_t now = millis();
+  timingDiagnosticsReport(now);
 
   HandleUARTout(); // Only used for non-CRSF output
 
