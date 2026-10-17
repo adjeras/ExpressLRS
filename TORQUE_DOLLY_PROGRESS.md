@@ -56,10 +56,39 @@
 - These observations do not claim individual verification of every drive telemetry field or every activation/locking step.
 - `CONTROLLED_STOP` can retain nonzero output while the handset decelerates; `LOCKED` is the neutral-output state.
 
+### Transmitter power-loss and recovery test
+
+#### Hardware result: passed for the observed power-loss path
+
+- The Android app was connected and the system slider remained `SYSTEM READY` throughout.
+- The transmitter was `READY`, the stick was fully forward, and both motors were running at full speed.
+- USB power was removed from the transmitter.
+- Both motors decelerated progressively to a stop.
+- The transmitter card changed to `CONNECTING`, then `RETRY EXHAUSTED`.
+- Both physical receivers showed blinking blue LEDs.
+- After transmitter power was restored, the card returned to `CONNECTED / LOCKED` with advancing uptime.
+- The motors remained stopped until the user deliberately switched the transmitter to `READY` and moved the stick.
+- Motion resumed normally without cycling the app slider.
+- No automatic system lock or mandatory app reactivation was demonstrated.
+
+The observed stop is attributed to the custom receiver-side ELRS failsafe implementation, not the transmitter-local `CONTROLLED_STOP` state or the VESC bridge `SAFELOCK` path.
+
+Receiver implementation reference:
+
+- Workspace: `C:/Users/Super/Documents/Arduino/expresslrs-rx-work`
+- Branch: `feature/torque-dolly-rx-failsafe`
+- Implementation commit: `6b1ecf1dfcc0fc73f633a4ca4c371e04ff6ad55f`
+- Source: `src/lib/ServoOutput/devServoOutput.cpp`
+- The receiver RF-loss PWM ramp is separate from transmitter `CONTROLLED_STOP` and bridge `SAFELOCK`.
+- The exact firmware commit installed on the physical receivers remains unconfirmed.
+
+This successful test covered transmitter power removal. RF loss while the transmitter remains powered and BLE stays connected was deferred and remains unverified.
+
 ### Remaining B2 test gaps
 
 - RF range remains unqualified.
 - Packet-delivery quality remains unqualified.
+- RF loss while the transmitter remains powered and BLE stays connected remains unverified.
 - Failsafe behavior during BLE activity remains unqualified.
 
 ## Next test
@@ -68,6 +97,7 @@ The following remain unverified:
 
 - RF range.
 - Packet-delivery quality.
-- Failsafe behavior under BLE activity.
+- RF loss while the transmitter remains powered and BLE stays connected.
+- Failsafe behavior during BLE activity.
 
 This document records hardware observations only; it does not establish RF range, packet-delivery, or failsafe qualification.
