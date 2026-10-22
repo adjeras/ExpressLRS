@@ -12,13 +12,16 @@ constexpr int PIN_Y = 2;
 constexpr int PIN_READY_SWITCH = 44;
 constexpr int PIN_STATUS_LED = 43;
 
-constexpr int X_MIN = 400;
-constexpr int X_CENTER = 1724;
-constexpr int X_MAX = 2860;
+// Initial direct-3.3V joystick references from observed ADC endpoints.
+// The low endpoint margin is conservative below the measured minimum; the
+// high endpoint reaches the 12-bit ADC ceiling at the mechanical endpoint.
+constexpr int X_MIN = 64;
+constexpr int X_CENTER = 1938;
+constexpr int X_MAX = 4095;
 
-constexpr int Y_MIN = 390;
-constexpr int Y_CENTER = 1707;
-constexpr int Y_MAX = 2860;
+constexpr int Y_MIN = 64;
+constexpr int Y_CENTER = 1925;
+constexpr int Y_MAX = 4095;
 
 constexpr int ADC_RESOLUTION_BITS = 12;
 constexpr adc_attenuation_t ADC_ATTENUATION = ADC_11db;
@@ -76,12 +79,20 @@ constexpr float MIN_STEERING_AUTHORITY = 30.0f;
 // -----------------------------------------------------------------------------
 constexpr unsigned long READY_SWITCH_DEBOUNCE_MS = 30;
 constexpr unsigned long INACTIVITY_LOCK_MS = 120000;
+constexpr uint8_t DEFAULT_AUTO_POWER_OFF_MINUTES = 3;
+constexpr uint8_t AUTO_POWER_OFF_MINUTES_MIN = 1;
+constexpr uint8_t AUTO_POWER_OFF_MINUTES_MAX = 60;
 constexpr unsigned long ACTIVITY_QUALIFICATION_MS = 100;
 constexpr unsigned long DIAGNOSTIC_INTERVAL_MS = 100;
 constexpr unsigned long INACTIVITY_BLINK_PERIOD_MS = 1000;
 constexpr unsigned long INACTIVITY_BLINK_RED_MS = 100;
+constexpr unsigned long BUTTON_FEEDBACK_BLINK_PERIOD_MS = 200;
+constexpr unsigned long BUTTON_FEEDBACK_BLINK_ON_MS = 100;
+constexpr unsigned long AUTO_POWER_OFF_DIAGNOSTIC_INTERVAL_MS = 5000;
 
 constexpr uint8_t STATUS_LED_RED = 64;
+constexpr uint8_t STATUS_LED_PINK_RED = 64;
+constexpr uint8_t STATUS_LED_PINK_BLUE = 64;
 constexpr uint8_t STATUS_LED_GREEN = 64;
 constexpr uint8_t STATUS_LED_AMBER_RED = 64;
 constexpr uint8_t STATUS_LED_AMBER_GREEN = 32;

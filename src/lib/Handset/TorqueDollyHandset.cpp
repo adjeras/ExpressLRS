@@ -7,18 +7,44 @@
 #include "crsf_protocol.h"
 #include "common.h"
 #include "timingDiagnostics.h"
+#include <Preferences.h>
 
 #if defined(TORQUE_DOLLY_BLE_TELEMETRY)
 namespace
 {
 portMUX_TYPE diagnosticStateMux = portMUX_INITIALIZER_UNLOCKED;
 TorqueDollyDiagnosticState diagnosticState = TorqueDollyDiagnosticState::Locked;
+portMUX_TYPE joystickSnapshotMux = portMUX_INITIALIZER_UNLOCKED;
+TorqueDollyJoystickSnapshot joystickSnapshot = {};
 }
 #endif
 
 namespace
 {
 using namespace TorqueDollyControlParameters;
+
+Preferences autoPowerOffPreferences;
+portMUX_TYPE autoPowerOffStateMux = portMUX_INITIALIZER_UNLOCKED;
+uint8_t autoPowerOffMinutes = DEFAULT_AUTO_POWER_OFF_MINUTES;
+volatile bool autoPowerOffRequest = false;
+volatile uint32_t autoPowerOffGeneration = 0;
+
+void loadAutoPowerOffMinutes()
+{
+    if (!autoPowerOffPreferences.begin("td_power", false))
+    {
+        return;
+    }
+    const uint8_t saved = autoPowerOffPreferences.getUChar(
+        "minutes", DEFAULT_AUTO_POWER_OFF_MINUTES);
+    portENTER_CRITICAL(&autoPowerOffStateMux);
+    autoPowerOffMinutes = saved >= AUTO_POWER_OFF_MINUTES_MIN &&
+        saved <= AUTO_POWER_OFF_MINUTES_MAX
+        ? saved : DEFAULT_AUTO_POWER_OFF_MINUTES;
+    autoPowerOffGeneration++;
+    portEXIT_CRITICAL(&autoPowerOffStateMux);
+    autoPowerOffPreferences.end();
+}
 
 float applyDeadband(float value)
 {
@@ -137,8 +163,53 @@ uint32_t mapDriveToCrsfChannel(float drive)
 }
 }
 
+uint8_t TorqueDollyHandset::getAutoPowerOffMinutes()
+{
+    return autoPowerOffMinutes;
+}
+
+bool TorqueDollyHandset::setAutoPowerOffMinutes(uint8_t minutes)
+{
+    if (minutes < AUTO_POWER_OFF_MINUTES_MIN ||
+        minutes > AUTO_POWER_OFF_MINUTES_MAX ||
+        !autoPowerOffPreferences.begin("td_power", false))
+    {
+        return false;
+    }
+
+    const size_t written = autoPowerOffPreferences.putUChar("minutes", minutes);
+    const bool writeSucceeded = written == 1 &&
+        autoPowerOffPreferences.getUChar("minutes", 0) == minutes;
+    autoPowerOffPreferences.end();
+    if (!writeSucceeded)
+    {
+        return false;
+    }
+
+    portENTER_CRITICAL(&autoPowerOffStateMux);
+    autoPowerOffMinutes = minutes;
+    autoPowerOffGeneration++;
+    portEXIT_CRITICAL(&autoPowerOffStateMux);
+    return true;
+}
+
+bool TorqueDollyHandset::consumeAutoPowerOffRequest()
+{
+    portENTER_CRITICAL(&autoPowerOffStateMux);
+    const bool requested = autoPowerOffRequest;
+    autoPowerOffRequest = false;
+    portEXIT_CRITICAL(&autoPowerOffStateMux);
+    return requested;
+}
+
+bool TorqueDollyHandset::isAutoPowerOffSuspended()
+{
+    return torqueDollyPowerButtonHeld() || torqueDollyShutdownActive;
+}
+
 void TorqueDollyHandset::Begin()
 {
+    loadAutoPowerOffMinutes();
     pinMode(PIN_READY_SWITCH, INPUT_PULLUP);
     neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, 0);
 
@@ -228,6 +299,18 @@ void TorqueDollyHandset::handleInput()
     static unsigned long activityQualificationStartedAt = 0;
     static unsigned long inactivityResetCount = 0;
     static bool inactivityLocked = false;
+    static unsigned long autoPowerOffStartedAt = 0;
+    static unsigned long autoPowerOffActivityCandidateStartedAt = 0;
+    static bool autoPowerOffActivityQualified = false;
+    static unsigned long calibrationTimeoutStartedAt = 0;
+    static uint32_t observedAutoPowerOffGeneration = 0;
+    static unsigned long lastAutoPowerOffDiagnosticAt = 0;
+    static unsigned long autoPowerOffNonNeutralResetCount = 0;
+    static unsigned long autoPowerOffSuspensionResetCount = 0;
+    static unsigned long autoPowerOffGenerationChangeCount = 0;
+    static unsigned long autoPowerOffNonNeutralResetReportCount = 0;
+    static unsigned long autoPowerOffSuspensionResetReportCount = 0;
+    static unsigned long autoPowerOffGenerationChangeReportCount = 0;
 #if defined(TORQUE_DOLLY_INACTIVITY_VISUAL_DIAGNOSTICS)
     static unsigned long magentaVisibleUntil = 0;
 #endif
@@ -266,6 +349,10 @@ void TorqueDollyHandset::handleInput()
         bool calibrationFailed
     ) {
         static bool initialized = false;
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+        static bool lastButtonFeedbackActive = false;
+        static bool lastButtonFeedbackOn = false;
+#endif
         static ReadyState lastState;
         static bool lastInactivityLocked = false;
         static bool lastInactivityRed = false;
@@ -277,9 +364,40 @@ void TorqueDollyHandset::handleInput()
             isInactivityLocked &&
             state == ReadyState::Locked &&
             now % INACTIVITY_BLINK_PERIOD_MS < INACTIVITY_BLINK_RED_MS;
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+        const TorqueDollyButtonFeedbackSnapshot buttonFeedback =
+            getTorqueDollyButtonFeedback();
+        const bool buttonFeedbackOn = !buttonFeedback.pending ||
+            static_cast<uint32_t>(now - buttonFeedback.blinkStartedAtMs) %
+                BUTTON_FEEDBACK_BLINK_PERIOD_MS < BUTTON_FEEDBACK_BLINK_ON_MS;
+
+        if (buttonFeedback.active)
+        {
+            if (!lastButtonFeedbackActive ||
+                buttonFeedbackOn != lastButtonFeedbackOn)
+            {
+                neopixelWrite(
+                    PIN_STATUS_LED,
+                    buttonFeedbackOn ? STATUS_LED_PINK_RED : 0,
+                    0,
+                    buttonFeedbackOn ? STATUS_LED_PINK_BLUE : 0
+                );
+                lastButtonFeedbackOn = buttonFeedbackOn;
+            }
+            lastButtonFeedbackActive = true;
+            return;
+        }
+
+        const bool feedbackJustEnded = lastButtonFeedbackActive;
+        lastButtonFeedbackActive = false;
+        lastButtonFeedbackOn = false;
+#else
+        const bool feedbackJustEnded = false;
+#endif
 
         if (
             initialized &&
+            !feedbackJustEnded &&
             calibrationComplete &&
             state == lastState &&
             isInactivityLocked == lastInactivityLocked &&
@@ -721,6 +839,26 @@ void TorqueDollyHandset::handleInput()
                         windowsEnoughSamples ? "PASS" : "FAIL"
             );
 
+#if defined(TORQUE_DOLLY_JOYSTICK_DIAGNOSTICS)
+            // Diagnostic wiring mode never adopts a new center or blocks
+            // sampling on the production calibration acceptance checks.
+            if (calibrationAccepted)
+            {
+                Serial.println(
+                    "JOYSTICK_DIAGNOSTICS calibration accepted; "
+                    "using existing reference centers"
+                );
+            }
+            else
+            {
+                Serial.println(
+                    "JOYSTICK_DIAGNOSTICS calibration rejected; "
+                    "using existing reference centers"
+                );
+            }
+            calibrationState = StartupCalibrationState::Succeeded;
+            startupNeutral = true;
+#else
             if (calibrationAccepted)
             {
                 runtimeXCenter = xMean;
@@ -730,7 +868,12 @@ void TorqueDollyHandset::handleInput()
                 filterInitialized = true;
                 calibrationState = StartupCalibrationState::Succeeded;
                 startupNeutral = true;
-                inactivityStartedAt = 0;
+                calibrationTimeoutStartedAt = 0;
+                autoPowerOffStartedAt = now;
+                autoPowerOffActivityCandidateStartedAt = 0;
+                autoPowerOffActivityQualified = false;
+                inactivityStartedAt = now;
+                activityQualificationStartedAt = 0;
                 activityQualificationStartedAt = 0;
                 inactivityLocked = false;
                 readyTransitionArmed = false;
@@ -740,6 +883,7 @@ void TorqueDollyHandset::handleInput()
                 calibrationState = StartupCalibrationState::RetryDelay;
                 calibrationRetryStartedAt = now;
             }
+#endif
         }
     }
     else if (
@@ -862,6 +1006,208 @@ void TorqueDollyHandset::handleInput()
     bool joystickNeutral =
         fabs(xNormalized) <= DEADBAND &&
         fabs(yNormalized) <= DEADBAND;
+    const char *readyStateName =
+        readyState == ReadyState::Ready ? "Ready" :
+        readyState == ReadyState::Locked ? "Locked" : "ControlledStop";
+
+    uint8_t configuredAutoPowerOffMinutes;
+    uint32_t configuredAutoPowerOffGeneration;
+    bool autoPowerOffRequestSnapshot;
+    portENTER_CRITICAL(&autoPowerOffStateMux);
+    configuredAutoPowerOffMinutes = autoPowerOffMinutes;
+    configuredAutoPowerOffGeneration = autoPowerOffGeneration;
+    autoPowerOffRequestSnapshot = autoPowerOffRequest;
+    portEXIT_CRITICAL(&autoPowerOffStateMux);
+
+    if (configuredAutoPowerOffGeneration != observedAutoPowerOffGeneration)
+    {
+        observedAutoPowerOffGeneration = configuredAutoPowerOffGeneration;
+        autoPowerOffGenerationChangeCount++;
+        autoPowerOffStartedAt = now;
+        autoPowerOffActivityCandidateStartedAt = 0;
+        autoPowerOffActivityQualified = false;
+        calibrationTimeoutStartedAt = now;
+    }
+
+    const bool firmwareUpdateActive =
+        connectionState == wifiUpdate || connectionState == serialUpdate;
+    const bool calibrationTimeoutSuspended =
+        torqueDollyPowerButtonHeld() || firmwareUpdateActive;
+
+    if (calibrationState == StartupCalibrationState::Succeeded)
+    {
+        calibrationTimeoutStartedAt = 0;
+    }
+    else if (calibrationTimeoutSuspended)
+    {
+        calibrationTimeoutStartedAt = 0;
+    }
+    else if (calibrationTimeoutStartedAt == 0)
+    {
+        calibrationTimeoutStartedAt = now;
+    }
+    else if (
+        static_cast<uint32_t>(now - calibrationTimeoutStartedAt) >=
+            static_cast<uint32_t>(configuredAutoPowerOffMinutes) * 60UL * 1000UL)
+    {
+        portENTER_CRITICAL(&autoPowerOffStateMux);
+        autoPowerOffRequest = true;
+        portEXIT_CRITICAL(&autoPowerOffStateMux);
+        Serial.printf("AUTO_POWER_OFF_REQUEST published reason=calibration_timeout\n");
+        calibrationTimeoutStartedAt = now;
+    }
+
+    if (calibrationState != StartupCalibrationState::Succeeded)
+    {
+        autoPowerOffStartedAt = 0;
+        autoPowerOffActivityCandidateStartedAt = 0;
+        autoPowerOffActivityQualified = false;
+    }
+    else if (isAutoPowerOffSuspended() ||
+        firmwareUpdateActive ||
+        connectionState > FAILURE_STATES)
+    {
+        if (autoPowerOffStartedAt != 0)
+        {
+            autoPowerOffSuspensionResetCount++;
+        }
+        autoPowerOffStartedAt = 0;
+        autoPowerOffActivityCandidateStartedAt = 0;
+        autoPowerOffActivityQualified = false;
+    }
+    else if (!joystickNeutral)
+    {
+        if (autoPowerOffActivityCandidateStartedAt == 0)
+        {
+            autoPowerOffActivityCandidateStartedAt = now;
+        }
+        else if (
+            !autoPowerOffActivityQualified &&
+            now - autoPowerOffActivityCandidateStartedAt >=
+                ACTIVITY_QUALIFICATION_MS
+        )
+        {
+            autoPowerOffActivityQualified = true;
+            autoPowerOffStartedAt = 0;
+            autoPowerOffNonNeutralResetCount++;
+        }
+
+        if (autoPowerOffActivityQualified)
+        {
+            autoPowerOffStartedAt = 0;
+        }
+    }
+    else
+    {
+        const bool wasActivityQualified = autoPowerOffActivityQualified;
+        const bool hadActivityCandidate =
+            autoPowerOffActivityCandidateStartedAt != 0;
+        autoPowerOffActivityCandidateStartedAt = 0;
+        autoPowerOffActivityQualified = false;
+
+        if (wasActivityQualified || autoPowerOffStartedAt == 0)
+        {
+            autoPowerOffStartedAt = now;
+        }
+        else if (hadActivityCandidate)
+        {
+            // An unqualified excursion must not alter the existing idle epoch.
+        }
+    }
+
+    if (
+        calibrationState == StartupCalibrationState::Succeeded &&
+        !isAutoPowerOffSuspended() &&
+        !firmwareUpdateActive &&
+        connectionState <= FAILURE_STATES &&
+        joystickNeutral &&
+        autoPowerOffActivityCandidateStartedAt == 0 &&
+        !autoPowerOffActivityQualified &&
+        autoPowerOffStartedAt != 0 &&
+        (uint32_t)(now - autoPowerOffStartedAt) >=
+            static_cast<uint32_t>(configuredAutoPowerOffMinutes) * 60UL * 1000UL)
+    {
+        portENTER_CRITICAL(&autoPowerOffStateMux);
+        autoPowerOffRequest = true;
+        portEXIT_CRITICAL(&autoPowerOffStateMux);
+        Serial.printf("AUTO_POWER_OFF_REQUEST published elapsed_ms=%lu\n",
+            static_cast<unsigned long>(now - autoPowerOffStartedAt));
+        autoPowerOffStartedAt = now;
+    }
+
+    const bool autoPowerOffTimerRunning = autoPowerOffStartedAt != 0;
+    const unsigned long autoPowerOffElapsed = autoPowerOffTimerRunning
+        ? now - autoPowerOffStartedAt : 0;
+    const bool calibrationTimeoutRunning =
+        calibrationTimeoutStartedAt != 0;
+    const unsigned long calibrationTimeoutElapsed =
+        calibrationTimeoutRunning ? now - calibrationTimeoutStartedAt : 0;
+    const char *autoPowerOffReason =
+        calibrationState != StartupCalibrationState::Succeeded
+            ? "calibration"
+            : isAutoPowerOffSuspended()
+                ? "button_or_shutdown"
+                : connectionState == wifiUpdate || connectionState > FAILURE_STATES
+                    ? "connection_state"
+                    : !joystickNeutral ? "joystick_non_neutral"
+                    : autoPowerOffTimerRunning ? "running" : "idle";
+    if (now - lastAutoPowerOffDiagnosticAt >=
+        AUTO_POWER_OFF_DIAGNOSTIC_INTERVAL_MS)
+    {
+        const unsigned long nonNeutralResetsSinceReport =
+            autoPowerOffNonNeutralResetCount -
+            autoPowerOffNonNeutralResetReportCount;
+        const unsigned long suspensionResetsSinceReport =
+            autoPowerOffSuspensionResetCount -
+            autoPowerOffSuspensionResetReportCount;
+        const unsigned long generationChangesSinceReport =
+            autoPowerOffGenerationChangeCount -
+            autoPowerOffGenerationChangeReportCount;
+        Serial.printf(
+            "AUTO_POWER_OFF_DIAG minutes=%u neutral=%s "
+            "x_norm=%7.2f y_norm=%7.2f calibration=%s "
+            "ready_state=%s inactivity_locked=%s "
+            "button_held=%s connection_state=%d excluded=%s "
+            "timer=%s elapsed_ms=%lu activity_candidate=%s "
+            "activity_qualified=%s candidate_ms=%lu "
+            "calibration_timer=%s calibration_elapsed_ms=%lu "
+            "nonneutral_resets=%lu "
+            "suspension_resets=%lu generation_changes=%lu reason=%s "
+            "generation=%lu request=%s\n",
+            configuredAutoPowerOffMinutes,
+            joystickNeutral ? "yes" : "no",
+            xNormalized,
+            yNormalized,
+            calibrationState == StartupCalibrationState::Succeeded
+                ? "succeeded" : "not_succeeded",
+            readyStateName,
+            inactivityLocked ? "yes" : "no",
+            torqueDollyPowerButtonHeld() ? "yes" : "no",
+            static_cast<int>(connectionState),
+            connectionState > FAILURE_STATES ? "yes" : "no",
+            autoPowerOffTimerRunning ? "running" : "stopped",
+            autoPowerOffElapsed,
+            autoPowerOffActivityCandidateStartedAt != 0 ? "yes" : "no",
+            autoPowerOffActivityQualified ? "yes" : "no",
+            autoPowerOffActivityCandidateStartedAt == 0
+                ? 0UL : now - autoPowerOffActivityCandidateStartedAt,
+            calibrationTimeoutRunning ? "running" : "stopped",
+            calibrationTimeoutElapsed,
+            nonNeutralResetsSinceReport,
+            suspensionResetsSinceReport,
+            generationChangesSinceReport,
+            autoPowerOffReason,
+            static_cast<unsigned long>(configuredAutoPowerOffGeneration),
+            autoPowerOffRequestSnapshot ? "yes" : "no"
+        );
+        lastAutoPowerOffDiagnosticAt = now;
+        autoPowerOffNonNeutralResetReportCount =
+            autoPowerOffNonNeutralResetCount;
+        autoPowerOffSuspensionResetReportCount =
+            autoPowerOffSuspensionResetCount;
+        autoPowerOffGenerationChangeReportCount =
+            autoPowerOffGenerationChangeCount;
+    }
 
 #if defined(TORQUE_DOLLY_INACTIVITY_VISUAL_DIAGNOSTICS)
     if (readyState == ReadyState::Ready &&
@@ -913,6 +1259,16 @@ void TorqueDollyHandset::handleInput()
             activityQualificationStartedAt = 0;
         }
     }
+
+#if defined(TORQUE_DOLLY_JOYSTICK_DIAGNOSTICS)
+    // Diagnostic wiring mode is observational only: remain locked and keep
+    // both output commands neutral regardless of switch or joystick input.
+    readyState = ReadyState::Locked;
+    inactivityLocked = false;
+    inactivityStartedAt = 0;
+    activityQualificationStartedAt = 0;
+    readyTransitionArmed = false;
+#endif
 
     if (readyState != ReadyState::Ready)
     {
@@ -1066,6 +1422,20 @@ void TorqueDollyHandset::handleInput()
     ChannelData[1] = rightChannel;
     RCdataLastRecv = micros();
 
+#if defined(TORQUE_DOLLY_BLE_TELEMETRY)
+    portENTER_CRITICAL(&joystickSnapshotMux);
+    joystickSnapshot.sequence++;
+    joystickSnapshot.xRaw = static_cast<uint16_t>(constrain(xRaw, 0, 65535));
+    joystickSnapshot.yRaw = static_cast<uint16_t>(constrain(yRaw, 0, 65535));
+    joystickSnapshot.xFiltered = xFiltered;
+    joystickSnapshot.yFiltered = yFiltered;
+    joystickSnapshot.xCenter = runtimeXCenter;
+    joystickSnapshot.yCenter = runtimeYCenter;
+    joystickSnapshot.xCommand = x;
+    joystickSnapshot.yCommand = y;
+    portEXIT_CRITICAL(&joystickSnapshotMux);
+#endif
+
     static unsigned long lastDiagnostic = 0;
     if (now - lastDiagnostic >= DIAGNOSTIC_INTERVAL_MS)
     {
@@ -1159,6 +1529,14 @@ TorqueDollyDiagnosticState TorqueDollyHandset::getDiagnosticState()
     TorqueDollyDiagnosticState state = diagnosticState;
     portEXIT_CRITICAL(&diagnosticStateMux);
     return state;
+}
+
+TorqueDollyJoystickSnapshot TorqueDollyHandset::getJoystickSnapshot()
+{
+    portENTER_CRITICAL(&joystickSnapshotMux);
+    TorqueDollyJoystickSnapshot snapshot = joystickSnapshot;
+    portEXIT_CRITICAL(&joystickSnapshotMux);
+    return snapshot;
 }
 #endif
 

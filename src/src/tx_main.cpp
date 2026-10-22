@@ -18,6 +18,8 @@
 #include "devBLE.h"
 #if defined(TORQUE_DOLLY_BLE_TELEMETRY) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
 #include "devTorqueDollyBLE.h"
+#include "TorqueDollyHandset.h"
+#include "TorqueDollyControlParameters.h"
 #endif
 #include "devLUA.h"
 #include "devWIFI.h"
@@ -83,6 +85,10 @@ LQCALC<25> LQCalc;
 
 volatile bool busyTransmitting;
 static volatile bool ModelUpdatePending;
+
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+volatile bool torqueDollyShutdownActive = false;
+#endif
 
 uint8_t MSPDataPackage[5];
 #define BindingSpamAmount 25
@@ -655,6 +661,13 @@ void ICACHE_RAM_ATTR timerCallback()
     return;
   }
 
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+  if (torqueDollyShutdownActive)
+  {
+    return;
+  }
+#endif
+
   Radio.isFirstRxIrq = true;
 
   // Sync OpenTX to this point
@@ -712,6 +725,13 @@ static void UARTdisconnected()
 
 static void UARTconnected()
 {
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+  if (torqueDollyShutdownActive)
+  {
+    return;
+  }
+#endif
+
   #if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
   webserverPreventAutoStart = true;
   #endif
@@ -1416,10 +1436,182 @@ static void cyclePower()
   }
 }
 
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+namespace {
+
+constexpr uint8_t TORQUE_DOLLY_POWER_HOLD_GPIO = 4;
+constexpr uint8_t TORQUE_DOLLY_POWER_BUTTON_GPIO = 3;
+constexpr uint32_t TORQUE_DOLLY_BUTTON_DEBOUNCE_MS = 30;
+constexpr uint32_t TORQUE_DOLLY_BUTTON_SHUTDOWN_MS = 3000;
+
+bool torqueDollyButtonInitialized = false;
+bool torqueDollyButtonRawPressed = false;
+bool torqueDollyButtonPressed = false;
+bool torqueDollyButtonShutdownEnabled = false;
+bool torqueDollyButtonShutdownPending = false;
+uint32_t torqueDollyButtonBlinkStartedAtMs = 0;
+portMUX_TYPE torqueDollyButtonMux = portMUX_INITIALIZER_UNLOCKED;
+uint32_t torqueDollyButtonChangedAt = 0;
+uint32_t torqueDollyButtonPressedAt = 0;
+
+void enterTorqueDollyShutdown()
+{
+  if (torqueDollyShutdownActive)
+  {
+    return;
+  }
+
+  torqueDollyShutdownActive = true;
+  portENTER_CRITICAL(&torqueDollyButtonMux);
+  torqueDollyButtonShutdownPending = false;
+  portEXIT_CRITICAL(&torqueDollyButtonMux);
+
+  // Stop the existing transmit timer and enter the existing disconnected/locked
+  // state before removing the power hold. No later loop work can reactivate it.
+  hwTimer::stop();
+  connectionState = noCrossfire;
+  digitalWrite(TORQUE_DOLLY_POWER_HOLD_GPIO, LOW);
+  Serial.printf("POWER_BUTTON POWER_OFF\n");
+}
+
+} // namespace
+
+bool torqueDollyPowerButtonHeld()
+{
+  portENTER_CRITICAL(&torqueDollyButtonMux);
+  const bool pressed = torqueDollyButtonPressed;
+  portEXIT_CRITICAL(&torqueDollyButtonMux);
+  return pressed;
+}
+
+TorqueDollyButtonFeedbackSnapshot getTorqueDollyButtonFeedback()
+{
+  TorqueDollyButtonFeedbackSnapshot snapshot;
+  portENTER_CRITICAL(&torqueDollyButtonMux);
+  snapshot.active = torqueDollyButtonPressed && torqueDollyButtonShutdownEnabled;
+  snapshot.pending = torqueDollyButtonShutdownPending;
+  snapshot.blinkStartedAtMs = torqueDollyButtonBlinkStartedAtMs;
+  portEXIT_CRITICAL(&torqueDollyButtonMux);
+  return snapshot;
+}
+
+static void updateTorqueDollyPowerButton(uint32_t nowMs)
+{
+  if (torqueDollyShutdownActive)
+  {
+    return;
+  }
+
+  if (torqueDollyShutdownActive)
+  {
+    return;
+  }
+
+  const bool rawPressed = digitalRead(TORQUE_DOLLY_POWER_BUTTON_GPIO) == LOW;
+
+  if (!torqueDollyButtonInitialized)
+  {
+    portENTER_CRITICAL(&torqueDollyButtonMux);
+    torqueDollyButtonInitialized = true;
+    torqueDollyButtonRawPressed = rawPressed;
+    torqueDollyButtonPressed = rawPressed;
+    torqueDollyButtonShutdownPending = false;
+    torqueDollyButtonBlinkStartedAtMs = 0;
+    torqueDollyButtonChangedAt = nowMs;
+    portEXIT_CRITICAL(&torqueDollyButtonMux);
+
+    if (rawPressed)
+    {
+      torqueDollyButtonPressedAt = nowMs;
+      Serial.printf("POWER_BUTTON PRESS\n");
+    }
+    else
+    {
+      // Require a debounced release before a startup-held button can request shutdown.
+      portENTER_CRITICAL(&torqueDollyButtonMux);
+      torqueDollyButtonShutdownEnabled = true;
+      portEXIT_CRITICAL(&torqueDollyButtonMux);
+    }
+
+    return;
+  }
+
+  if (rawPressed != torqueDollyButtonRawPressed)
+  {
+    torqueDollyButtonRawPressed = rawPressed;
+    torqueDollyButtonChangedAt = nowMs;
+  }
+
+  bool buttonPressed;
+  bool shutdownEnabled;
+  bool shutdownPending;
+  portENTER_CRITICAL(&torqueDollyButtonMux);
+  buttonPressed = torqueDollyButtonPressed;
+  shutdownEnabled = torqueDollyButtonShutdownEnabled;
+  shutdownPending = torqueDollyButtonShutdownPending;
+  portEXIT_CRITICAL(&torqueDollyButtonMux);
+
+  if (rawPressed == buttonPressed ||
+      (uint32_t)(nowMs - torqueDollyButtonChangedAt) < TORQUE_DOLLY_BUTTON_DEBOUNCE_MS)
+  {
+    if (shutdownEnabled &&
+        buttonPressed &&
+        !shutdownPending &&
+        (uint32_t)(nowMs - torqueDollyButtonPressedAt) >= TORQUE_DOLLY_BUTTON_SHUTDOWN_MS)
+    {
+      portENTER_CRITICAL(&torqueDollyButtonMux);
+      torqueDollyButtonShutdownPending = true;
+      torqueDollyButtonBlinkStartedAtMs = nowMs;
+      portEXIT_CRITICAL(&torqueDollyButtonMux);
+      Serial.printf("POWER_BUTTON SHUTDOWN_PENDING release_to_power_off\n");
+    }
+    return;
+  }
+
+  portENTER_CRITICAL(&torqueDollyButtonMux);
+  torqueDollyButtonPressed = rawPressed;
+  torqueDollyButtonShutdownPending = false;
+  torqueDollyButtonBlinkStartedAtMs = 0;
+  if (rawPressed)
+  {
+    torqueDollyButtonShutdownEnabled = true;
+  }
+  portEXIT_CRITICAL(&torqueDollyButtonMux);
+
+  if (rawPressed)
+  {
+    torqueDollyButtonPressedAt = nowMs;
+    Serial.printf("POWER_BUTTON PRESS\n");
+  }
+  else
+  {
+    const uint32_t durationMs = nowMs - torqueDollyButtonPressedAt;
+    Serial.printf("POWER_BUTTON RELEASE duration_ms=%u\n", durationMs);
+
+    if (shutdownEnabled && shutdownPending)
+    {
+      enterTorqueDollyShutdown();
+    }
+  }
+}
+
+#endif
+
 void setup()
 {
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+  // Prototype B soft-power latch. Keep asserted for the lifetime of this firmware.
+  constexpr uint8_t TORQUE_DOLLY_POWER_HOLD_GPIO = 4;
+  pinMode(TORQUE_DOLLY_POWER_HOLD_GPIO, OUTPUT);
+  digitalWrite(TORQUE_DOLLY_POWER_HOLD_GPIO, HIGH);
+#endif
+
   if (setupHardwareFromOptions())
   {
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+    pinMode(TORQUE_DOLLY_POWER_BUTTON_GPIO, INPUT);
+#endif
+
     setupTarget();
     // Register the devices with the framework
     devicesRegister(ui_devices, ARRAY_SIZE(ui_devices));
@@ -1506,7 +1698,17 @@ void setup()
 void loop()
 {
   uint32_t now = millis();
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+  updateTorqueDollyPowerButton(now);
+#endif
   timingDiagnosticsReport(now);
+
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+  if (torqueDollyShutdownActive)
+  {
+    return;
+  }
+#endif
 
   HandleUARTout(); // Only used for non-CRSF output
 
@@ -1522,8 +1724,33 @@ void loop()
     UpdateConnectDisconnectStatus();
   }
 
+  static uint32_t lastTorqueDollyHeartbeat = 0;
+  if (now - lastTorqueDollyHeartbeat >= 5000)
+  {
+    lastTorqueDollyHeartbeat = now;
+    Serial.printf(
+      "TORQUE_DOLLY_LOOP_HEARTBEAT running=yes connection_state=%d "
+      "shutdown_active=%s\n",
+      static_cast<int>(connectionState),
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+      torqueDollyShutdownActive ? "yes" : "no"
+#else
+      "no"
+#endif
+    );
+  }
+
   // Update UI devices
   devicesUpdate(now);
+
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+  if (TorqueDollyHandset::consumeAutoPowerOffRequest())
+  {
+    Serial.printf("AUTO_POWER_OFF_REQUEST consumed; invoking shutdown\\n");
+    enterTorqueDollyShutdown();
+    return;
+  }
+#endif
 
   // Not a device because it must be run on the loop core
   checkBackpackUpdate();
