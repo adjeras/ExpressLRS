@@ -146,7 +146,7 @@ public:
         const std::string raw = characteristic->getValue();
         char *end = nullptr;
         const long minutes = strtol(raw.c_str(), &end, 10);
-        const bool valid = end != raw.c_str() && *end == '\\0' &&
+        const bool valid = end != raw.c_str() && *end == '\0' &&
             minutes >= TorqueDollyControlParameters::AUTO_POWER_OFF_MINUTES_MIN &&
             minutes <= TorqueDollyControlParameters::AUTO_POWER_OFF_MINUTES_MAX;
         if (!valid || !TorqueDollyHandset::setAutoPowerOffMinutes(
