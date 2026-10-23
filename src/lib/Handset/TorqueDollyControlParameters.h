@@ -50,10 +50,20 @@ constexpr float RESPONSE_CURVE_OUTPUT[] = {
     0, 2, 6, 12, 20, 30, 42, 56, 70, 85, 100
 };
 
+constexpr float STEERING_RESPONSE_CURVE_OUTPUT[] = {
+    0, 8, 18, 30, 43, 55, 67, 77, 86, 93, 100
+};
+
+constexpr float STEERING_RESPONSE_BLEND_END = 40.0f;
 constexpr int RESPONSE_CURVE_SEGMENT_COUNT = 10;
 constexpr float DRIVE_PERCENT_MIN = -100.0f;
 constexpr float DRIVE_PERCENT_MAX = 100.0f;
 constexpr float DRIVE_PERCENT_RANGE = 100.0f;
+
+// Bounded, approximate throttle-only compensation for a rounded joystick
+// gate. This is not an exact inverse mapping or a fitted calibration.
+constexpr float THROTTLE_GATE_COMPENSATION_FACTOR = 0.5f;
+constexpr float THROTTLE_GATE_MAX_GAIN = 1.25f;
 
 // -----------------------------------------------------------------------------
 // Acceleration and deceleration
@@ -68,9 +78,9 @@ constexpr float DECEL_RATE_STOP = 70.0f;
 constexpr float FULL_STEERING_AUTHORITY = 70.0f;
 constexpr float PIVOT_TURN_MAX = 40.0f;
 constexpr float PIVOT_BLEND_END = 40.0f;
-constexpr float STEERING_ACCEL_RATE_STANDSTILL = 200.0f;
+constexpr float STEERING_ACCEL_RATE_STANDSTILL = 60.0f;
 constexpr float STEERING_ACCEL_RATE_MOVING = 90.0f;
-constexpr float STEERING_DECEL_RATE_STANDSTILL = 50.0f;
+constexpr float STEERING_DECEL_RATE_STANDSTILL = 120.0f;
 constexpr float STEERING_DECEL_RATE_MOVING = 120.0f;
 constexpr float MIN_STEERING_AUTHORITY = 30.0f;
 

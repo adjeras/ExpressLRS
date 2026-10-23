@@ -100,6 +100,31 @@ float applyResponseCurve(float value)
     return sign * DRIVE_PERCENT_MAX;
 }
 
+float applySteeringResponseCurve(float value)
+{
+    const auto &input = RESPONSE_CURVE_INPUT;
+    const auto &output = STEERING_RESPONSE_CURVE_OUTPUT;
+
+    float sign = (value < 0.0f) ? -1.0f : 1.0f;
+    float v = fabs(value);
+
+    for (int i = 0; i < RESPONSE_CURVE_SEGMENT_COUNT; i++)
+    {
+        if (v <= input[i + 1])
+        {
+            float t = (v - input[i]) /
+                (input[i + 1] - input[i]);
+
+            float result = output[i] +
+                t * (output[i + 1] - output[i]);
+
+            return sign * result;
+        }
+    }
+
+    return sign * DRIVE_PERCENT_MAX;
+}
+
 float applySlewRate(
     float target,
     float current,
@@ -334,11 +359,47 @@ void TorqueDollyHandset::handleInput()
     float yNormalized = normalizeAxis(
         yFiltered, Y_MIN, runtimeYCenter, Y_MAX);
 
+    // The physical steering axis is opposite to the desired vehicle turn
+    // direction. Invert it once after calibration/normalization so raw and
+    // filtered telemetry, calibration, and all downstream safety logic remain
+    // unchanged.
+    xNormalized = -xNormalized;
+
     float x = applyDeadband(xNormalized);
     float y = applyDeadband(yNormalized);
 
-    x = applyResponseCurve(x);
+    // Apply bounded, approximate throttle-only compensation for a rounded
+    // joystick gate. This is not an exact inverse mapping or fitted
+    // calibration. Safety and neutral decisions continue using the original
+    // normalized inputs above; X remains unchanged.
+    const float steeringFraction =
+        constrain(fabs(x) / DRIVE_PERCENT_RANGE, 0.0f, 1.0f);
+    const float throttleGateGain = min(
+        THROTTLE_GATE_MAX_GAIN,
+        1.0f / sqrtf(
+            1.0f - THROTTLE_GATE_COMPENSATION_FACTOR *
+            steeringFraction * steeringFraction
+        )
+    );
+    y = constrain(
+        y * throttleGateGain,
+        DRIVE_PERCENT_MIN,
+        DRIVE_PERCENT_MAX
+    );
+
+    const float steeringOriginal = applyResponseCurve(x);
     y = applyResponseCurve(y);
+
+    // Blend steering response from the original curve toward the moving
+    // curve using shaped throttle command, not measured vehicle speed.
+    const float steeringBlend = constrain(
+        fabs(y) / STEERING_RESPONSE_BLEND_END,
+        0.0f,
+        1.0f
+    );
+    const float steeringMoving = applySteeringResponseCurve(x);
+    x = steeringOriginal +
+        steeringBlend * (steeringMoving - steeringOriginal);
 
     auto updateStatusLed = [](
         ReadyState state,
