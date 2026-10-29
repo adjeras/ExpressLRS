@@ -57,6 +57,40 @@ ExpressLRS currently supports hardware from a wide range of manufacturers. In pr
 
 Please refer to the [Hardware Selection] page (https://www.expresslrs.org/hardware/hardware-selection/) on the website for guidance. We do not manufacture any of our hardware, so we can only provide limited support for faulty hardware.
 
+## Torque Dolly S3 F27 standalone handset
+
+The Torque Dolly S3 F27 handset uses a single external power button for power and
+Ready/Locked control:
+
+- GPIO3: active-low external power-button sense input.
+- GPIO4: power-hold output; it remains asserted during operation and is released
+  during shutdown.
+- GPIO43: external status LED, with compile-time brightness controlled by
+  `STATUS_LED_BRIGHTNESS_PERCENT` in `TorqueDollyControlParameters.h`.
+- GPIO44: unused by the single-button control logic; it is configured as a plain
+  input without an internal pull resistor.
+
+The handset boots Locked. A fresh debounced button press held for at least 700 ms
+and less than 3000 ms unlocks on release, provided calibration has succeeded and
+the joystick is neutral. A press while Ready starts ControlledStop immediately;
+its release cannot unlock. A hold reaching 3000 ms latches shutdown pending, and
+power-off occurs on the debounced release after RF shutdown and release of the
+GPIO4 power hold.
+
+For a data-only USB cable, keep the external power button held while connecting
+or uploading so the GPIO4 power latch remains asserted. Release it only after
+power and the upload procedure are complete. Do not assume native USB/JTAG
+power behavior when GPIO3 is used by the external button.
+
+### Validation record
+
+The full `Unified_ESP32S3_2400_TX_via_UART` target build passed with all four
+Torque Dolly flags and `ELRS_UNIFIED_CONFIG=diy.tx_2400.torque-dolly-s3-f27`.
+The correction-package helper test reported 145 passed assertions in ChatGPT's
+environment. Amir additionally reported successful flashing and physical
+operation of the handset. Physical validation is reported by Amir and was not
+repeated in this session.
+
 ## Developers
 
 If you are a developer and would like to contribute to the project, feel free to join the [discord](https://discord.gg/expresslrs) and chat about bugs and issues. You can also look for issues at the [GitHub Issue Tracker](https://github.com/ExpressLRS/ExpressLRS/issues). The best thing to do is to submit a Pull Request to the GitHub Repository.

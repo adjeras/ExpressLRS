@@ -1,6 +1,7 @@
 #pragma once
 
 #include "handset.h"
+#include "TorqueDollyButton.h"
 
 #if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
 struct TorqueDollyButtonFeedbackSnapshot
@@ -12,6 +13,7 @@ struct TorqueDollyButtonFeedbackSnapshot
 
 extern volatile bool torqueDollyShutdownActive;
 bool torqueDollyPowerButtonHeld();
+TorqueDollyButton::Snapshot getTorqueDollyButtonSnapshot();
 TorqueDollyButtonFeedbackSnapshot getTorqueDollyButtonFeedback();
 #endif
 

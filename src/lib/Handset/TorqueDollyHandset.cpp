@@ -235,8 +235,13 @@ bool TorqueDollyHandset::isAutoPowerOffSuspended()
 void TorqueDollyHandset::Begin()
 {
     loadAutoPowerOffMinutes();
-    pinMode(PIN_READY_SWITCH, INPUT_PULLUP);
-    neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, 0);
+    pinMode(PIN_READY_SWITCH, INPUT);
+    neopixelWrite(
+        PIN_STATUS_LED,
+        static_cast<uint16_t>(STATUS_LED_RED) * STATUS_LED_BRIGHTNESS_PERCENT / 100,
+        0,
+        0
+    );
 
     analogReadResolution(ADC_RESOLUTION_BITS);
     analogSetPinAttenuation(PIN_X, ADC_ATTENUATION);
@@ -314,11 +319,7 @@ void TorqueDollyHandset::handleInput()
     };
 
     static ReadyState readyState = ReadyState::Locked;
-    static bool switchInitialized = false;
-    static bool switchRawReady = false;
-    static bool switchStableReady = false;
-    static unsigned long switchChangedAt = 0;
-    static bool readyTransitionArmed = false;
+    static TorqueDollyButton::Gesture buttonGesture;
     static bool startupNeutral = true;
     static unsigned long inactivityStartedAt = 0;
     static unsigned long activityQualificationStartedAt = 0;
@@ -421,6 +422,23 @@ void TorqueDollyHandset::handleInput()
         static bool lastCalibrationComplete = false;
         static bool lastCalibrationFailed = false;
 
+        const auto scaleExternalStatusLed = [](uint8_t intensity) {
+            return static_cast<uint8_t>(
+                static_cast<uint16_t>(intensity) *
+                STATUS_LED_BRIGHTNESS_PERCENT / 100);
+        };
+
+        const auto writeExternalStatusLed = [
+            &scaleExternalStatusLed
+        ](uint8_t red, uint8_t green, uint8_t blue) {
+            neopixelWrite(
+                PIN_STATUS_LED,
+                scaleExternalStatusLed(red),
+                scaleExternalStatusLed(green),
+                scaleExternalStatusLed(blue)
+            );
+        };
+
         bool inactivityRed =
             isInactivityLocked &&
             state == ReadyState::Locked &&
@@ -437,8 +455,7 @@ void TorqueDollyHandset::handleInput()
             if (!lastButtonFeedbackActive ||
                 buttonFeedbackOn != lastButtonFeedbackOn)
             {
-                neopixelWrite(
-                    PIN_STATUS_LED,
+                writeExternalStatusLed(
                     buttonFeedbackOn ? STATUS_LED_PINK_RED : 0,
                     0,
                     buttonFeedbackOn ? STATUS_LED_PINK_BLUE : 0
@@ -486,17 +503,16 @@ void TorqueDollyHandset::handleInput()
                     CALIBRATION_FAILURE_RED_MS;
                 if (failureRed)
                 {
-                    neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, 0);
+                    writeExternalStatusLed(STATUS_LED_RED, 0, 0);
                 }
                 else
                 {
-                    neopixelWrite(PIN_STATUS_LED, 0, 0, 0);
+                    writeExternalStatusLed(0, 0, 0);
                 }
             }
             else
             {
-                neopixelWrite(
-                    PIN_STATUS_LED,
+                writeExternalStatusLed(
                     0,
                     0,
                     STATUS_LED_CALIBRATION_BLUE
@@ -509,11 +525,11 @@ void TorqueDollyHandset::handleInput()
         {
             if (inactivityRed)
             {
-                neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, 0);
+                writeExternalStatusLed(STATUS_LED_RED, 0, 0);
             }
             else
             {
-                neopixelWrite(PIN_STATUS_LED, 0, STATUS_LED_GREEN, 0);
+                writeExternalStatusLed(0, STATUS_LED_GREEN, 0);
             }
             return;
         }
@@ -521,7 +537,7 @@ void TorqueDollyHandset::handleInput()
 #if defined(TORQUE_DOLLY_INACTIVITY_VISUAL_DIAGNOSTICS)
         if (state == ReadyState::Ready && visualDiagnosticActive)
         {
-            neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, STATUS_LED_RED);
+            writeExternalStatusLed(STATUS_LED_RED, 0, STATUS_LED_RED);
             return;
         }
 #endif
@@ -529,14 +545,13 @@ void TorqueDollyHandset::handleInput()
         switch (state)
         {
             case ReadyState::Locked:
-                neopixelWrite(PIN_STATUS_LED, STATUS_LED_RED, 0, 0);
+                writeExternalStatusLed(STATUS_LED_RED, 0, 0);
                 break;
             case ReadyState::Ready:
-                neopixelWrite(PIN_STATUS_LED, 0, STATUS_LED_GREEN, 0);
+                writeExternalStatusLed(0, STATUS_LED_GREEN, 0);
                 break;
             case ReadyState::ControlledStop:
-                neopixelWrite(
-                    PIN_STATUS_LED,
+                writeExternalStatusLed(
                     STATUS_LED_AMBER_RED,
                     STATUS_LED_AMBER_GREEN,
                     0
@@ -545,7 +560,6 @@ void TorqueDollyHandset::handleInput()
         }
     };
 
-    bool switchReady = digitalRead(PIN_READY_SWITCH) == HIGH;
     unsigned long nowMillis = now;
     bool calibrationWasComplete =
         calibrationState == StartupCalibrationState::Succeeded;
@@ -935,9 +949,8 @@ void TorqueDollyHandset::handleInput()
                 autoPowerOffActivityQualified = false;
                 inactivityStartedAt = now;
                 activityQualificationStartedAt = 0;
-                activityQualificationStartedAt = 0;
                 inactivityLocked = false;
-                readyTransitionArmed = false;
+                buttonGesture.cancel();
             }
             else
             {
@@ -965,74 +978,37 @@ void TorqueDollyHandset::handleInput()
         calibrationYSumSquares = 0.0f;
     }
 
-    if (!switchInitialized)
+    const auto buttonState = getTorqueDollyButtonSnapshot();
+    const auto gestureState = readyState == ReadyState::Ready
+        ? TorqueDollyButton::State::Ready
+        : readyState == ReadyState::ControlledStop
+            ? TorqueDollyButton::State::ControlledStop
+            : TorqueDollyButton::State::Locked;
+    const bool canUnlock =
+        !torqueDollyShutdownActive &&
+        calibrationState == StartupCalibrationState::Succeeded &&
+        calibrationWasComplete &&
+        fabs(xNormalized) <= DEADBAND &&
+        fabs(yNormalized) <= DEADBAND && !startupNeutral;
+    const auto buttonAction = buttonGesture.update(buttonState, gestureState,
+        canUnlock, BUTTON_UNLOCK_MIN_PRESS_MS, BUTTON_SHUTDOWN_PRESS_MS);
+    if (buttonAction == TorqueDollyButton::Action::Lock)
     {
-        switchInitialized = true;
-        switchRawReady = switchReady;
-        switchStableReady = switchReady;
-        switchChangedAt = nowMillis;
-        readyTransitionArmed = !switchStableReady;
+        readyState = ReadyState::ControlledStop;
+        activityQualificationStartedAt = 0;
+        inactivityLocked = false;
     }
-    else if (switchReady != switchRawReady)
+    else if (buttonAction == TorqueDollyButton::Action::Unlock)
     {
-        switchRawReady = switchReady;
-        switchChangedAt = nowMillis;
-    }
-    else if (
-        switchStableReady != switchRawReady &&
-        nowMillis - switchChangedAt >= READY_SWITCH_DEBOUNCE_MS
-    )
-    {
-        bool wasStableReady = switchStableReady;
-        switchStableReady = switchRawReady;
-
-        if (!switchStableReady)
-        {
-            activityQualificationStartedAt = 0;
-            inactivityLocked = false;
-
-            if (readyState == ReadyState::Ready)
-            {
-                readyState = ReadyState::ControlledStop;
-                readyTransitionArmed = false;
-            }
-            else if (readyState == ReadyState::Locked)
-            {
-                readyTransitionArmed = true;
-            }
-        }
-        else if (
-            !wasStableReady &&
-            readyState == ReadyState::Locked &&
-            calibrationState == StartupCalibrationState::Succeeded &&
-            calibrationWasComplete &&
-            readyTransitionArmed &&
-            fabs(xNormalized) <= DEADBAND &&
-            fabs(yNormalized) <= DEADBAND &&
-            !startupNeutral
-        )
-        {
-            readyState = ReadyState::Ready;
-            readyTransitionArmed = false;
-            activityQualificationStartedAt = 0;
-            inactivityLocked = false;
-            inactivityStartedAt = nowMillis;
-        }
+        readyState = ReadyState::Ready;
+        inactivityLocked = false;
+        activityQualificationStartedAt = 0;
+        inactivityStartedAt = nowMillis;
     }
 
     static float xDrive = 0.0f;
     static float yDrive = 0.0f;
     static unsigned long lastUpdate = millis();
-
-    // A transition debounced during calibration is not eligible. Once the
-    // calibration-completion call has finished, a currently Locked switch
-    // position can arm the next deliberate Locked-to-Ready transition.
-    if (!calibrationWasComplete &&
-        calibrationState == StartupCalibrationState::Succeeded &&
-        !switchStableReady)
-    {
-        readyTransitionArmed = true;
-    }
 
     float dt = (now - lastUpdate) / 1000.0f;
     lastUpdate = now;
@@ -1314,7 +1290,7 @@ void TorqueDollyHandset::handleInput()
             now - inactivityStartedAt >= INACTIVITY_LOCK_MS)
         {
             readyState = ReadyState::Locked;
-            readyTransitionArmed = false;
+            buttonGesture.cancel();
             inactivityLocked = true;
             inactivityStartedAt = 0;
             activityQualificationStartedAt = 0;
@@ -1328,7 +1304,7 @@ void TorqueDollyHandset::handleInput()
     inactivityLocked = false;
     inactivityStartedAt = 0;
     activityQualificationStartedAt = 0;
-    readyTransitionArmed = false;
+    buttonGesture.cancel();
 #endif
 
     if (readyState != ReadyState::Ready)
@@ -1421,7 +1397,7 @@ void TorqueDollyHandset::handleInput()
         xDrive = 0.0f;
         yDrive = 0.0f;
         readyState = ReadyState::Locked;
-        readyTransitionArmed = !switchStableReady;
+        buttonGesture.cancel();
         inactivityLocked = false;
         inactivityStartedAt = 0;
         activityQualificationStartedAt = 0;

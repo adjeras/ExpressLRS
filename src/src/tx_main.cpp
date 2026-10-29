@@ -19,6 +19,10 @@
 #if defined(TORQUE_DOLLY_BLE_TELEMETRY) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
 #include "devTorqueDollyBLE.h"
 #include "TorqueDollyHandset.h"
+
+#endif
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+#include "TorqueDollyHandset.h"
 #include "TorqueDollyControlParameters.h"
 #endif
 #include "devLUA.h"
@@ -1441,18 +1445,8 @@ namespace {
 
 constexpr uint8_t TORQUE_DOLLY_POWER_HOLD_GPIO = 4;
 constexpr uint8_t TORQUE_DOLLY_POWER_BUTTON_GPIO = 3;
-constexpr uint32_t TORQUE_DOLLY_BUTTON_DEBOUNCE_MS = 30;
-constexpr uint32_t TORQUE_DOLLY_BUTTON_SHUTDOWN_MS = 3000;
-
-bool torqueDollyButtonInitialized = false;
-bool torqueDollyButtonRawPressed = false;
-bool torqueDollyButtonPressed = false;
-bool torqueDollyButtonShutdownEnabled = false;
-bool torqueDollyButtonShutdownPending = false;
-uint32_t torqueDollyButtonBlinkStartedAtMs = 0;
+TorqueDollyButton::Input torqueDollyButtonInput;
 portMUX_TYPE torqueDollyButtonMux = portMUX_INITIALIZER_UNLOCKED;
-uint32_t torqueDollyButtonChangedAt = 0;
-uint32_t torqueDollyButtonPressedAt = 0;
 
 void enterTorqueDollyShutdown()
 {
@@ -1462,9 +1456,6 @@ void enterTorqueDollyShutdown()
   }
 
   torqueDollyShutdownActive = true;
-  portENTER_CRITICAL(&torqueDollyButtonMux);
-  torqueDollyButtonShutdownPending = false;
-  portEXIT_CRITICAL(&torqueDollyButtonMux);
 
   // Stop the existing transmit timer and enter the existing disconnected/locked
   // state before removing the power hold. No later loop work can reactivate it.
@@ -1476,123 +1467,48 @@ void enterTorqueDollyShutdown()
 
 } // namespace
 
-bool torqueDollyPowerButtonHeld()
+TorqueDollyButton::Snapshot getTorqueDollyButtonSnapshot()
 {
   portENTER_CRITICAL(&torqueDollyButtonMux);
-  const bool pressed = torqueDollyButtonPressed;
+  const auto snapshot = torqueDollyButtonInput.snapshot;
   portEXIT_CRITICAL(&torqueDollyButtonMux);
-  return pressed;
+  return snapshot;
+}
+
+bool torqueDollyPowerButtonHeld()
+{
+  return getTorqueDollyButtonSnapshot().pressed;
 }
 
 TorqueDollyButtonFeedbackSnapshot getTorqueDollyButtonFeedback()
 {
+  const auto state = getTorqueDollyButtonSnapshot();
   TorqueDollyButtonFeedbackSnapshot snapshot;
-  portENTER_CRITICAL(&torqueDollyButtonMux);
-  snapshot.active = torqueDollyButtonPressed && torqueDollyButtonShutdownEnabled;
-  snapshot.pending = torqueDollyButtonShutdownPending;
-  snapshot.blinkStartedAtMs = torqueDollyButtonBlinkStartedAtMs;
-  portEXIT_CRITICAL(&torqueDollyButtonMux);
+  snapshot.active = state.pressed && state.eligible;
+  snapshot.pending = state.pending;
+  snapshot.blinkStartedAtMs = state.blinkStartedAt;
   return snapshot;
 }
 
 static void updateTorqueDollyPowerButton(uint32_t nowMs)
 {
-  if (torqueDollyShutdownActive)
-  {
-    return;
-  }
-
-  if (torqueDollyShutdownActive)
-  {
-    return;
-  }
-
+  if (torqueDollyShutdownActive) return;
   const bool rawPressed = digitalRead(TORQUE_DOLLY_POWER_BUTTON_GPIO) == LOW;
-
-  if (!torqueDollyButtonInitialized)
-  {
-    portENTER_CRITICAL(&torqueDollyButtonMux);
-    torqueDollyButtonInitialized = true;
-    torqueDollyButtonRawPressed = rawPressed;
-    torqueDollyButtonPressed = rawPressed;
-    torqueDollyButtonShutdownPending = false;
-    torqueDollyButtonBlinkStartedAtMs = 0;
-    torqueDollyButtonChangedAt = nowMs;
-    portEXIT_CRITICAL(&torqueDollyButtonMux);
-
-    if (rawPressed)
-    {
-      torqueDollyButtonPressedAt = nowMs;
-      Serial.printf("POWER_BUTTON PRESS\n");
-    }
-    else
-    {
-      // Require a debounced release before a startup-held button can request shutdown.
-      portENTER_CRITICAL(&torqueDollyButtonMux);
-      torqueDollyButtonShutdownEnabled = true;
-      portEXIT_CRITICAL(&torqueDollyButtonMux);
-    }
-
-    return;
-  }
-
-  if (rawPressed != torqueDollyButtonRawPressed)
-  {
-    torqueDollyButtonRawPressed = rawPressed;
-    torqueDollyButtonChangedAt = nowMs;
-  }
-
-  bool buttonPressed;
-  bool shutdownEnabled;
-  bool shutdownPending;
   portENTER_CRITICAL(&torqueDollyButtonMux);
-  buttonPressed = torqueDollyButtonPressed;
-  shutdownEnabled = torqueDollyButtonShutdownEnabled;
-  shutdownPending = torqueDollyButtonShutdownPending;
+  const auto before = torqueDollyButtonInput.snapshot;
+  torqueDollyButtonInput.update(rawPressed, nowMs,
+      TorqueDollyControlParameters::BUTTON_DEBOUNCE_MS,
+      TorqueDollyControlParameters::BUTTON_SHUTDOWN_PRESS_MS);
+  const auto after = torqueDollyButtonInput.snapshot;
   portEXIT_CRITICAL(&torqueDollyButtonMux);
 
-  if (rawPressed == buttonPressed ||
-      (uint32_t)(nowMs - torqueDollyButtonChangedAt) < TORQUE_DOLLY_BUTTON_DEBOUNCE_MS)
-  {
-    if (shutdownEnabled &&
-        buttonPressed &&
-        !shutdownPending &&
-        (uint32_t)(nowMs - torqueDollyButtonPressedAt) >= TORQUE_DOLLY_BUTTON_SHUTDOWN_MS)
-    {
-      portENTER_CRITICAL(&torqueDollyButtonMux);
-      torqueDollyButtonShutdownPending = true;
-      torqueDollyButtonBlinkStartedAtMs = nowMs;
-      portEXIT_CRITICAL(&torqueDollyButtonMux);
-      Serial.printf("POWER_BUTTON SHUTDOWN_PENDING release_to_power_off\n");
-    }
-    return;
+  if (after.sequence != before.sequence) {
+    if (after.pressed) Serial.printf("POWER_BUTTON PRESS\n");
+    else Serial.printf("POWER_BUTTON RELEASE duration_ms=%u\n", after.duration);
   }
-
-  portENTER_CRITICAL(&torqueDollyButtonMux);
-  torqueDollyButtonPressed = rawPressed;
-  torqueDollyButtonShutdownPending = false;
-  torqueDollyButtonBlinkStartedAtMs = 0;
-  if (rawPressed)
-  {
-    torqueDollyButtonShutdownEnabled = true;
-  }
-  portEXIT_CRITICAL(&torqueDollyButtonMux);
-
-  if (rawPressed)
-  {
-    torqueDollyButtonPressedAt = nowMs;
-    Serial.printf("POWER_BUTTON PRESS\n");
-  }
-  else
-  {
-    const uint32_t durationMs = nowMs - torqueDollyButtonPressedAt;
-    Serial.printf("POWER_BUTTON RELEASE duration_ms=%u\n", durationMs);
-
-    if (shutdownEnabled && shutdownPending)
-    {
-      enterTorqueDollyShutdown();
-    }
-  }
+  if (after.pending && !before.pending)
+    Serial.printf("POWER_BUTTON SHUTDOWN_PENDING release_to_power_off\n");
+  if (after.pending && !after.pressed) enterTorqueDollyShutdown();
 }
 
 #endif

@@ -87,7 +87,9 @@ constexpr float MIN_STEERING_AUTHORITY = 30.0f;
 // -----------------------------------------------------------------------------
 // Ready/Locked state machine and status LED
 // -----------------------------------------------------------------------------
-constexpr unsigned long READY_SWITCH_DEBOUNCE_MS = 30;
+constexpr unsigned long BUTTON_DEBOUNCE_MS = 30;
+constexpr unsigned long BUTTON_UNLOCK_MIN_PRESS_MS = 700;
+constexpr unsigned long BUTTON_SHUTDOWN_PRESS_MS = 3000;
 constexpr unsigned long INACTIVITY_LOCK_MS = 120000;
 constexpr uint8_t DEFAULT_AUTO_POWER_OFF_MINUTES = 3;
 constexpr uint8_t AUTO_POWER_OFF_MINUTES_MIN = 1;
@@ -99,6 +101,7 @@ constexpr unsigned long INACTIVITY_BLINK_RED_MS = 100;
 constexpr unsigned long BUTTON_FEEDBACK_BLINK_PERIOD_MS = 200;
 constexpr unsigned long BUTTON_FEEDBACK_BLINK_ON_MS = 100;
 constexpr unsigned long AUTO_POWER_OFF_DIAGNOSTIC_INTERVAL_MS = 5000;
+constexpr uint8_t STATUS_LED_BRIGHTNESS_PERCENT = 25;
 
 constexpr uint8_t STATUS_LED_RED = 64;
 constexpr uint8_t STATUS_LED_PINK_RED = 64;
