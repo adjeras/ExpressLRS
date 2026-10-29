@@ -1550,6 +1550,10 @@ void setup()
     config.SetStorageProvider(&eeprom); // Pass pointer to the Config class for access to storage
     config.Load(); // Load the stored values from eeprom
 
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+    Serial.printf("TORQUE_DOLLY_PINOUT radio_rst=%d\n", GPIO_PIN_RST);
+#endif
+
     Radio.currFreq = FHSSgetInitialFreq(); //set frequency first or an error will occur!!!
     #if defined(RADIO_SX127X)
     //Radio.currSyncWord = UID[3];

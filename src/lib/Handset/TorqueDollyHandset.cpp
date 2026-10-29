@@ -235,7 +235,6 @@ bool TorqueDollyHandset::isAutoPowerOffSuspended()
 void TorqueDollyHandset::Begin()
 {
     loadAutoPowerOffMinutes();
-    pinMode(PIN_READY_SWITCH, INPUT);
     neopixelWrite(
         PIN_STATUS_LED,
         static_cast<uint16_t>(STATUS_LED_RED) * STATUS_LED_BRIGHTNESS_PERCENT / 100,
@@ -767,7 +766,7 @@ void TorqueDollyHandset::handleInput()
             }
 
             constexpr unsigned long minWindowSamples = 5;
-            constexpr float maxWindowStdDev = 24.0f;
+            constexpr float maxWindowStdDev = STARTUP_CALIBRATION_WINDOW_MAX_STDDEV_RAW;
             constexpr float maxWindowMeanSpan = 24.0f;
             constexpr float maxWindowDrift = 16.0f;
             constexpr float maxWindowStep = 12.0f;

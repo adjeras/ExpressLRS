@@ -91,6 +91,20 @@ environment. Amir additionally reported successful flashing and physical
 operation of the handset. Physical validation is reported by Amir and was not
 repeated in this session.
 
+The active F27 hardware JSON is under the ignored `src/hardware` directory.
+The tracked copy is `docs/hardware/torque-dolly-s3-f27.json`; it must be
+restored to `src/hardware/TX/Torque Dolly S3 F27.json` before building from a
+fresh checkout. The physical RESET wire now connects to GPIO44; GPIO7 is
+reserved for future battery sensing and currently has nothing connected. The resolved startup radio-reset diagnostic was not
+captured on hardware. Calibration previously failed at threshold 24 with
+observed standard deviation approximately 26–33; experimental threshold 36
+allowed operation. The noise cause remains unresolved. Do not interpret these
+reports as completed motor-neutral or RF-range validation.
+
+Next steps are to design a power-off-isolated battery divider, validate ADC
+readings against a multimeter, and then add BLE telemetry and Android voltage
+display.
+
 ## Developers
 
 If you are a developer and would like to contribute to the project, feel free to join the [discord](https://discord.gg/expresslrs) and chat about bugs and issues. You can also look for issues at the [GitHub Issue Tracker](https://github.com/ExpressLRS/ExpressLRS/issues). The best thing to do is to submit a Pull Request to the GitHub Repository.

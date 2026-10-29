@@ -9,7 +9,6 @@ namespace TorqueDollyControlParameters
 // -----------------------------------------------------------------------------
 constexpr int PIN_X = 1;
 constexpr int PIN_Y = 2;
-constexpr int PIN_READY_SWITCH = 44;
 constexpr int PIN_STATUS_LED = 43;
 
 // Initial direct-3.3V joystick references from observed ADC endpoints.
@@ -31,6 +30,8 @@ constexpr unsigned long STARTUP_CALIBRATION_RETRY_DELAY_MS = 500;
 constexpr int STARTUP_CALIBRATION_CENTER_WINDOW_RAW = 60;
 constexpr int STARTUP_CALIBRATION_MAX_DEVIATION_RAW = 20;
 constexpr float STARTUP_CALIBRATION_MAX_STDDEV_RAW = 12.0f;
+// Temporary calibration experiment: use 36 instead of the previous 24 threshold.
+constexpr float STARTUP_CALIBRATION_WINDOW_MAX_STDDEV_RAW = 36.0f;
 constexpr unsigned long STARTUP_CALIBRATION_MIN_SAMPLES = 100;
 constexpr uint8_t STATUS_LED_CALIBRATION_BLUE = 64;
 constexpr unsigned long CALIBRATION_FAILURE_BLINK_PERIOD_MS = 500;

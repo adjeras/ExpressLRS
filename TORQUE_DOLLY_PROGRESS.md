@@ -91,6 +91,44 @@ This successful test covered transmitter power removal. RF loss while the transm
 - RF loss while the transmitter remains powered and BLE stays connected remains unverified.
 - Failsafe behavior during BLE activity remains unqualified.
 
+## Single-button handset and F27 reset relocation
+
+### Pinout and wiring
+
+- GPIO3: external power button; unchanged.
+- GPIO4: power-hold output; unchanged.
+- GPIO43: external status LED; unchanged.
+- GPIO1/2: joystick X/Y ADC inputs; unchanged.
+- The physical F27 RESET wire now connects to RX/GPIO44.
+- GPIO7 is reserved for future battery sensing; nothing is connected there yet.
+- The active custom F27 hardware JSON is ignored by Git:
+  `src/hardware/TX/Torque Dolly S3 F27.json`.
+- A byte-identical tracked copy is maintained at
+  `docs/hardware/torque-dolly-s3-f27.json`; restore it to the active hardware
+  path before building from a fresh checkout.
+
+### Calibration experiment
+
+- Startup calibration failed with the previous per-window standard-deviation
+  threshold of 24; observed standard deviation was approximately 26–33.
+- The temporary threshold was raised to 36 through
+  `STARTUP_CALIBRATION_WINDOW_MAX_STDDEV_RAW`.
+- Threshold 36 allowed operation. Amir reports normal operation and several
+  successful power cycles, including battery-only operation.
+- The noise cause remains unresolved; threshold 36 is experimental.
+- The resolved startup diagnostic
+  `TORQUE_DOLLY_PINOUT radio_rst=<value>` was added, but its output was not
+  captured on hardware.
+
+These observations do not claim a completed motor-neutral test or RF-range
+validation.
+
+### Next steps
+
+- Design a battery divider with power-off isolation.
+- Validate ADC readings against a multimeter.
+- Add BLE battery telemetry and Android voltage display.
+
 ## Next test
 
 The following remain unverified:
@@ -99,5 +137,6 @@ The following remain unverified:
 - Packet-delivery quality.
 - RF loss while the transmitter remains powered and BLE stays connected.
 - Failsafe behavior during BLE activity.
+- Completed motor-neutral test.
 
-This document records hardware observations only; it does not establish RF range, packet-delivery, or failsafe qualification.
+This document records hardware observations only; it does not establish RF range, packet-delivery, motor-neutral, or failsafe qualification.
