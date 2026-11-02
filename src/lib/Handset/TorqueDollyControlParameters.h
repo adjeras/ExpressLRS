@@ -1,5 +1,7 @@
 #pragma once
 
+#include "TorqueDollyRfDiagnostics.h"
+
 #include <Arduino.h>
 
 namespace TorqueDollyControlParameters
@@ -32,6 +34,10 @@ constexpr int STARTUP_CALIBRATION_MAX_DEVIATION_RAW = 20;
 constexpr float STARTUP_CALIBRATION_MAX_STDDEV_RAW = 12.0f;
 // Temporary calibration experiment: use 36 instead of the previous 24 threshold.
 constexpr float STARTUP_CALIBRATION_WINDOW_MAX_STDDEV_RAW = 36.0f;
+
+// Read-only startup/RF diagnostics. Counters are printed from normal task context.
+constexpr bool TORQUE_DOLLY_RF_DIAGNOSTICS = true;
+constexpr uint8_t TORQUE_DOLLY_RF_DIAGNOSTIC_TRANSITIONS = 4;
 constexpr unsigned long STARTUP_CALIBRATION_MIN_SAMPLES = 100;
 constexpr uint8_t STATUS_LED_CALIBRATION_BLUE = 64;
 constexpr unsigned long CALIBRATION_FAILURE_BLINK_PERIOD_MS = 500;

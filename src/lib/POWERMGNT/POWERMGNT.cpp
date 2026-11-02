@@ -268,7 +268,12 @@ PowerLevels_e POWERMGNT::getDefaultPower()
 
 void POWERMGNT::setDefaultPower()
 {
+#if defined(TORQUE_DOLLY_BENCH_RF_DISABLED) && !defined(TORQUE_DOLLY_BENCH_RF_CONFIG_ONLY)
+    CurrentPower = MinPower;
+    return;
+#else
     setPower(getDefaultPower());
+#endif
 }
 
 void POWERMGNT::setPower(PowerLevels_e Power)
@@ -282,7 +287,7 @@ void POWERMGNT::setPower(PowerLevels_e Power)
 
     if (Power == CurrentPower)
         return;
-    
+
     CurrentPower = Power;
 
     // When using SubHGz with CE, limit to a max of 25mW.

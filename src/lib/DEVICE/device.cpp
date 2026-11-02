@@ -47,6 +47,11 @@ static void deviceTask(void *pvArgs);
 
 void devicesRegister(device_affinity_t *devices, uint8_t count)
 {
+#if defined(TORQUE_DOLLY_BENCH_RF_CONFIG_ONLY)
+    uiDevices = nullptr;
+    deviceCount = 0;
+    return;
+#else
     uiDevices = devices;
     deviceCount = count;
 
@@ -56,10 +61,14 @@ void devicesRegister(device_affinity_t *devices, uint8_t count)
         disableCore0WDT();
         xTaskCreatePinnedToCore(deviceTask, "deviceTask", 32768, NULL, 0, &xDeviceTask, 0);
     #endif
+#endif
 }
 
 void devicesInit()
 {
+#if defined(TORQUE_DOLLY_BENCH_RF_CONFIG_ONLY)
+    return;
+#endif
     int32_t core = CURRENT_CORE;
 
     for(size_t i=0 ; i<deviceCount ; i++) {
@@ -80,6 +89,9 @@ void devicesInit()
 
 void devicesStart()
 {
+#if defined(TORQUE_DOLLY_BENCH_RF_DISABLED) || defined(TORQUE_DOLLY_BENCH_RF_CONFIG_ONLY)
+    return;
+#endif
     int32_t core = CURRENT_CORE;
     unsigned long now = millis();
 
@@ -112,6 +124,9 @@ void devicesStop()
 
 void devicesTriggerEvent()
 {
+#if defined(TORQUE_DOLLY_BENCH_RF_CONFIG_ONLY)
+    return;
+#endif
     eventFired[0] = true;
     eventFired[1] = true;
     #if MULTICORE
@@ -167,12 +182,20 @@ static int _devicesUpdate(unsigned long now)
 
 void devicesUpdate(unsigned long now)
 {
+#if defined(TORQUE_DOLLY_BENCH_RF_CONFIG_ONLY)
+    return;
+#else
     _devicesUpdate(now);
+#endif
 }
 
 #if MULTICORE
 static void deviceTask(void *pvArgs)
 {
+#if defined(TORQUE_DOLLY_BENCH_RF_CONFIG_ONLY)
+    vTaskDelete(nullptr);
+    return;
+#endif
     xSemaphoreTake(taskSemaphore, portMAX_DELAY);
     devicesInit();
     xSemaphoreGive(completeSemaphore);
