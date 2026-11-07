@@ -82,6 +82,14 @@ static enum { stbIdle, stbRequested, stbBoosting } syncTelemBoostState = stbIdle
 ////////////////////////////////////////////////
 
 volatile uint32_t LastTLMpacketRecvMillis = 0;
+volatile uint32_t torqueDollyValidTelemetryPacketCount = 0;
+volatile uint32_t torqueDollyLinkStatsFrameCount = 0;
+volatile uint32_t torqueDollyLastLinkStatsMillis = 0;
+portMUX_TYPE torqueDollyLinkStatsMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t torqueDollyLinkStatsSequence = 0;
+volatile int8_t torqueDollyUplinkRssiDbm = 0;
+volatile int8_t torqueDollyUplinkSnrDb = 0;
+volatile uint8_t torqueDollyUplinkLq = 0;
 uint32_t TLMpacketReported = 0;
 static bool commitInProgress = false;
 
@@ -184,7 +192,24 @@ void switchDiversityAntennas()
 
 void ICACHE_RAM_ATTR LinkStatsFromOta(OTA_LinkStats_s * const ls)
 {
-  int8_t snrScaled = ls->SNR;
+  const int8_t snrScaled = ls->SNR;
+  const int8_t uplinkRssiDbm = -static_cast<int8_t>(ls->uplink_RSSI_1);
+#if defined(DEBUG_FREQ_CORRECTION)
+  const int8_t uplinkSnrDb = snrScaled;
+#else
+  const int8_t uplinkSnrDb = SNR_DESCALE(snrScaled);
+#endif
+  const uint8_t uplinkLq = ls->lq;
+  const uint32_t sampleMillis = millis();
+  portENTER_CRITICAL_ISR(&torqueDollyLinkStatsMux);
+  torqueDollyLinkStatsSequence++;
+  torqueDollyLinkStatsFrameCount++;
+  torqueDollyLastLinkStatsMillis = sampleMillis;
+  torqueDollyUplinkRssiDbm = uplinkRssiDbm;
+  torqueDollyUplinkSnrDb = uplinkSnrDb;
+  torqueDollyUplinkLq = uplinkLq;
+  torqueDollyLinkStatsSequence++;
+  portEXIT_CRITICAL_ISR(&torqueDollyLinkStatsMux);
   DynamicPower_TelemetryUpdate(snrScaled);
 
   // Antenna is the high bit in the RSSI_1 value
@@ -230,6 +255,7 @@ bool ICACHE_RAM_ATTR ProcessTLMpacket(SX12xxDriverCommon::rx_status const status
   }
 
   LastTLMpacketRecvMillis = millis();
+  torqueDollyValidTelemetryPacketCount++;
   LQCalc.add();
 
   Radio.GetLastPacketStats();
@@ -1485,7 +1511,10 @@ TorqueDollyButtonFeedbackSnapshot getTorqueDollyButtonFeedback()
   const auto state = getTorqueDollyButtonSnapshot();
   TorqueDollyButtonFeedbackSnapshot snapshot;
   snapshot.active = state.pressed && state.eligible;
+  snapshot.pressed = state.pressed;
   snapshot.pending = state.pending;
+  snapshot.eligible = state.eligible;
+  snapshot.pressedAtMs = state.pressedAt;
   snapshot.blinkStartedAtMs = state.blinkStartedAt;
   return snapshot;
 }
@@ -1645,6 +1674,49 @@ void loop()
   }
 
   static uint32_t lastTorqueDollyHeartbeat = 0;
+#if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
+  static uint32_t lastTorqueDollyTelemetryDiagnostic = 0;
+  if (now - lastTorqueDollyTelemetryDiagnostic >= 1000) {
+    lastTorqueDollyTelemetryDiagnostic = now;
+    const uint8_t storedTlm = config.GetTlm();
+    const uint8_t effectiveTlmDenom = ExpressLRS_currTlmDenom;
+    uint32_t linkStatsCount;
+    uint32_t validTelemetryCount;
+    uint32_t lastLinkStatsMillis;
+    int8_t uplinkRssiDbm;
+    int8_t uplinkSnrDb;
+    uint8_t uplinkLq;
+    uint32_t sequenceStart;
+    uint32_t sequenceEnd;
+    do {
+      sequenceStart = torqueDollyLinkStatsSequence;
+      linkStatsCount = torqueDollyLinkStatsFrameCount;
+      validTelemetryCount = torqueDollyValidTelemetryPacketCount;
+      lastLinkStatsMillis = torqueDollyLastLinkStatsMillis;
+      uplinkRssiDbm = torqueDollyUplinkRssiDbm;
+      uplinkSnrDb = torqueDollyUplinkSnrDb;
+      uplinkLq = torqueDollyUplinkLq;
+      sequenceEnd = torqueDollyLinkStatsSequence;
+    } while ((sequenceStart != sequenceEnd) || (sequenceStart & 1U));
+    const uint32_t linkStatsAge = linkStatsCount == 0 ? 0 : now - lastLinkStatsMillis;
+    Serial.printf("TORQUE_DOLLY_TLM_DIAGNOSTIC stored=%u effective_denom=%u effective=%s valid_packets=%lu link_stats=%lu link_age_ms=%lu ",
+                  storedTlm,
+                  effectiveTlmDenom,
+                  effectiveTlmDenom == 1 ? "disabled" : "enabled",
+                  static_cast<unsigned long>(validTelemetryCount),
+                  static_cast<unsigned long>(linkStatsCount),
+                  static_cast<unsigned long>(linkStatsAge));
+    if (linkStatsCount == 0) {
+      Serial.println("uplink_lq=unavailable uplink_rssi=unavailable uplink_snr=unavailable");
+    } else {
+      Serial.printf("uplink_lq=%u uplink_rssi=%d uplink_snr=%d freshness=%s\\n",
+                    uplinkLq,
+                    static_cast<int>(uplinkRssiDbm),
+                    static_cast<int>(uplinkSnrDb),
+                    linkStatsAge <= 2000 ? "fresh" : "stale");
+    }
+  }
+#endif
   if (now - lastTorqueDollyHeartbeat >= 5000)
   {
     lastTorqueDollyHeartbeat = now;

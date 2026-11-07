@@ -11,6 +11,14 @@
 #include "TorqueDollyHandset.h"
 #include "TorqueDollyControlParameters.h"
 
+extern portMUX_TYPE torqueDollyLinkStatsMux;
+extern volatile uint32_t torqueDollyLinkStatsSequence;
+extern volatile uint32_t torqueDollyLinkStatsFrameCount;
+extern volatile uint32_t torqueDollyLastLinkStatsMillis;
+extern volatile int8_t torqueDollyUplinkRssiDbm;
+extern volatile int8_t torqueDollyUplinkSnrDb;
+extern volatile uint8_t torqueDollyUplinkLq;
+
 #include <NimBLEDevice.h>
 #include <cstdio>
 
@@ -22,10 +30,25 @@ constexpr char CHARACTERISTIC_UUID[] = "7f2a0002-6d4e-4c8a-9b11-2e4d7a8f3101";
 constexpr char STATUS_CHARACTERISTIC_UUID[] = "7f2a0003-6d4e-4c8a-9b11-2e4d7a8f3101";
 constexpr char JOYSTICK_DIAGNOSTIC_CHARACTERISTIC_UUID[] = "7f2a0004-6d4e-4c8a-9b11-2e4d7a8f3101";
 constexpr char AUTO_POWER_OFF_CHARACTERISTIC_UUID[] = "7f2a0005-6d4e-4c8a-9b11-2e4d7a8f3101";
+constexpr char RF_LINK_STATISTICS_CHARACTERISTIC_UUID[] = "7f2a0006-6d4e-4c8a-9b11-2e4d7a8f3101";
 constexpr char IDENTIFICATION[] = "TD-TX-BLE-B1";
 constexpr size_t STATUS_VALUE_MAX_LENGTH = 64;
 constexpr size_t JOYSTICK_DIAGNOSTIC_VALUE_LENGTH = 20;
 constexpr uint16_t ADVERTISING_INTERVAL_UNITS = 800; // 800 * 0.625 ms = 500 ms
+constexpr uint8_t RF_LINK_STATS_VERSION = 1;
+constexpr uint8_t RF_LINK_STATS_FLAG_VALID = 1 << 0;
+constexpr uint8_t RF_LINK_STATS_FLAG_STALE = 1 << 1;
+constexpr uint8_t RF_LINK_STATS_FLAG_UNAVAILABLE = 1 << 2;
+constexpr size_t RF_LINK_STATS_VALUE_LENGTH = 12;
+
+// RF link statistics payload, exactly 12 little-endian bytes:
+// 0: uint8 version; 1: uint8 flags.
+// 2..3: uint16 sample sequence.
+// 4..5: uint16 sample age in milliseconds, saturated at 65535.
+// 6: uint8 uplink LQ, percent (0..100).
+// 7: int8 uplink RSSI in dBm.
+// 8: int8 uplink SNR in dB.
+// 9..11: reserved, zero. BLE connection state is not encoded here.
 
 // Joystick diagnostic payload: exactly 20 little-endian bytes.
 // 0: uint32 sequence; 4/6: uint16 raw X/Y ADC counts.
@@ -35,6 +58,10 @@ constexpr uint16_t ADVERTISING_INTERVAL_UNITS = 800; // 800 * 0.625 ms = 500 ms
 // raw, filtered, and center fields remain available for drift diagnosis.
 
 static bool started = false;
+static NimBLECharacteristic *rfLinkStatisticsCharacteristic = nullptr;
+static uint32_t lastRfLinkStatisticsPublishMs = 0;
+static NimBLEServer *bleServer = nullptr;
+static uint32_t lastRfLinkStatisticsDebugMs = 0;
 
 class StatusCharacteristicCallbacks final : public NimBLECharacteristicCallbacks
 {
@@ -129,6 +156,67 @@ public:
 
 static JoystickDiagnosticCharacteristicCallbacks joystickDiagnosticCallbacks;
 
+class RfLinkStatisticsCharacteristicCallbacks final : public NimBLECharacteristicCallbacks
+{
+public:
+    void onRead(NimBLECharacteristic *characteristic) override
+    {
+        update(characteristic);
+    }
+
+    static void update(NimBLECharacteristic *characteristic)
+    {
+        uint32_t sampleSequence;
+        uint32_t sampleMillis;
+        int8_t rssiDbm;
+        int8_t snrDb;
+        uint8_t lq;
+        portENTER_CRITICAL(&torqueDollyLinkStatsMux);
+        sampleSequence = torqueDollyLinkStatsFrameCount;
+        sampleMillis = torqueDollyLastLinkStatsMillis;
+        rssiDbm = torqueDollyUplinkRssiDbm;
+        snrDb = torqueDollyUplinkSnrDb;
+        lq = torqueDollyUplinkLq;
+        portEXIT_CRITICAL(&torqueDollyLinkStatsMux);
+
+        const uint32_t age = sampleSequence == 0 ? 0 : millis() - sampleMillis;
+        uint8_t flags = 0;
+        if (sampleSequence == 0) {
+            flags |= RF_LINK_STATS_FLAG_UNAVAILABLE;
+        } else if (age > 2000) {
+            flags |= RF_LINK_STATS_FLAG_STALE;
+        } else {
+            flags |= RF_LINK_STATS_FLAG_VALID;
+        }
+
+        uint8_t value[RF_LINK_STATS_VALUE_LENGTH] = {};
+        const uint16_t sequence = static_cast<uint16_t>(sampleSequence);
+        const uint16_t ageMs = static_cast<uint16_t>(age > 65535U ? 65535U : age);
+        value[0] = RF_LINK_STATS_VERSION;
+        value[1] = flags;
+        value[2] = static_cast<uint8_t>(sequence);
+        value[3] = static_cast<uint8_t>(sequence >> 8);
+        value[4] = static_cast<uint8_t>(ageMs);
+        value[5] = static_cast<uint8_t>(ageMs >> 8);
+        value[6] = lq;
+        value[7] = static_cast<uint8_t>(rssiDbm);
+        value[8] = static_cast<uint8_t>(snrDb);
+        characteristic->setValue(value, sizeof(value));
+        Serial.printf("TORQUE_DOLLY_RF_BLE_PAYLOAD seq=%u flags=0x%02X age_ms=%u lq=%u rssi=%d snr=%d hex=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\\n",
+                      sequence,
+                      flags,
+                      ageMs,
+                      lq,
+                      rssiDbm,
+                      snrDb,
+                      value[0], value[1], value[2], value[3],
+                      value[4], value[5], value[6], value[7],
+                      value[8], value[9], value[10], value[11]);
+    }
+};
+
+static RfLinkStatisticsCharacteristicCallbacks rfLinkStatisticsCallbacks;
+
 class AutoPowerOffCharacteristicCallbacks final : public NimBLECharacteristicCallbacks
 {
 public:
@@ -162,6 +250,37 @@ public:
 
 static AutoPowerOffCharacteristicCallbacks autoPowerOffCallbacks;
 
+static int event()
+{
+    return DURATION_IGNORE;
+}
+
+static int timeout()
+{
+    const uint32_t now = millis();
+    const bool connected = bleServer != nullptr && bleServer->getConnectedCount() > 0;
+    if (rfLinkStatisticsCharacteristic != nullptr &&
+        now - lastRfLinkStatisticsPublishMs >= 500)
+    {
+        lastRfLinkStatisticsPublishMs = now;
+        RfLinkStatisticsCharacteristicCallbacks::update(
+            rfLinkStatisticsCharacteristic);
+        if (now - lastRfLinkStatisticsDebugMs >= 1000)
+        {
+            lastRfLinkStatisticsDebugMs = now;
+            Serial.printf("TORQUE_DOLLY_RF_BLE_TIMEOUT connected=%d subscribed=%d sample_seq=%lu\\n",
+                          connected ? 1 : 0,
+                          rfLinkStatisticsCharacteristic->getSubscribedCount() > 0 ? 1 : 0,
+                          static_cast<unsigned long>(torqueDollyLinkStatsFrameCount));
+        }
+        if (connected && rfLinkStatisticsCharacteristic->getSubscribedCount() > 0)
+        {
+            rfLinkStatisticsCharacteristic->notify();
+        }
+    }
+    return 500;
+}
+
 static int start()
 {
     if (started)
@@ -172,6 +291,7 @@ static int start()
     NimBLEDevice::setPower(ESP_PWR_LVL_P3);
 
     NimBLEServer *server = NimBLEDevice::createServer();
+    bleServer = server;
     if (server == nullptr)
     {
         DBGLN("Torque Dolly BLE: server creation failed");
@@ -248,6 +368,18 @@ static int start()
     autoPowerOffCharacteristic->setValue(std::to_string(
         TorqueDollyHandset::getAutoPowerOffMinutes()));
 
+    rfLinkStatisticsCharacteristic = service->createCharacteristic(
+        RF_LINK_STATISTICS_CHARACTERISTIC_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY,
+        RF_LINK_STATS_VALUE_LENGTH);
+    if (rfLinkStatisticsCharacteristic == nullptr)
+    {
+        DBGLN("Torque Dolly BLE: RF link statistics characteristic creation failed");
+        return DURATION_NEVER;
+    }
+    RfLinkStatisticsCharacteristicCallbacks::update(rfLinkStatisticsCharacteristic);
+    rfLinkStatisticsCharacteristic->setCallbacks(&rfLinkStatisticsCallbacks);
+
     if (!service->start())
     {
         DBGLN("Torque Dolly BLE: service start failed");
@@ -274,7 +406,7 @@ static int start()
     }
 
     DBGLN("Torque Dolly BLE: advertising started on core %d", xPortGetCoreID());
-    return DURATION_NEVER;
+    return 500;
 }
 
 } // namespace
@@ -282,8 +414,8 @@ static int start()
 device_t TorqueDollyBLE_device = {
     .initialize = nullptr,
     .start = start,
-    .event = nullptr,
-    .timeout = nullptr,
+    .event = event,
+    .timeout = timeout,
 };
 
 #endif
