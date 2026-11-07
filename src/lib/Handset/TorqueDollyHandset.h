@@ -7,7 +7,10 @@
 struct TorqueDollyButtonFeedbackSnapshot
 {
     bool active;
+    bool pressed;
     bool pending;
+    bool eligible;
+    uint32_t pressedAtMs;
     uint32_t blinkStartedAtMs;
 };
 

@@ -1,7 +1,5 @@
 #pragma once
 
-#include "TorqueDollyRfDiagnostics.h"
-
 #include <Arduino.h>
 
 namespace TorqueDollyControlParameters

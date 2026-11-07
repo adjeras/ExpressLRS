@@ -407,7 +407,8 @@ void TorqueDollyHandset::handleInput()
         unsigned long now,
         bool visualDiagnosticActive,
         bool calibrationComplete,
-        bool calibrationFailed
+        bool calibrationFailed,
+        bool canUnlock
     ) {
         static bool initialized = false;
 #if defined(TORQUE_DOLLY_RF_TEST) && defined(TORQUE_DOLLY_HANDSET) && defined(PLATFORM_ESP32_S3) && defined(TARGET_TX)
@@ -448,6 +449,44 @@ void TorqueDollyHandset::handleInput()
         const bool buttonFeedbackOn = !buttonFeedback.pending ||
             static_cast<uint32_t>(now - buttonFeedback.blinkStartedAtMs) %
                 BUTTON_FEEDBACK_BLINK_PERIOD_MS < BUTTON_FEEDBACK_BLINK_ON_MS;
+        const bool unlockCue =
+            state == ReadyState::Locked &&
+            buttonFeedback.pressed &&
+            buttonFeedback.eligible &&
+            !buttonFeedback.pending &&
+            canUnlock &&
+            static_cast<uint32_t>(now - buttonFeedback.pressedAtMs) >=
+                BUTTON_UNLOCK_MIN_PRESS_MS &&
+            static_cast<uint32_t>(now - buttonFeedback.pressedAtMs) <
+                BUTTON_SHUTDOWN_PRESS_MS;
+
+        if (buttonFeedback.pending)
+        {
+            if (!lastButtonFeedbackActive ||
+                buttonFeedbackOn != lastButtonFeedbackOn)
+            {
+                writeExternalStatusLed(
+                    buttonFeedbackOn ? STATUS_LED_PINK_RED : 0,
+                    0,
+                    buttonFeedbackOn ? STATUS_LED_PINK_BLUE : 0
+                );
+                lastButtonFeedbackOn = buttonFeedbackOn;
+            }
+            lastButtonFeedbackActive = true;
+            return;
+        }
+
+        if (unlockCue)
+        {
+            writeExternalStatusLed(
+                0,
+                STATUS_LED_AMBER_GREEN,
+                STATUS_LED_AMBER_RED
+            );
+            lastButtonFeedbackActive = true;
+            lastButtonFeedbackOn = true;
+            return;
+        }
 
         if (buttonFeedback.active)
         {
@@ -1408,7 +1447,8 @@ void TorqueDollyHandset::handleInput()
         now,
         visualDiagnosticActive,
         calibrationState == StartupCalibrationState::Succeeded,
-        calibrationState == StartupCalibrationState::RetryDelay
+        calibrationState == StartupCalibrationState::RetryDelay,
+        canUnlock
     );
 
     float lowSpeedSteeringLimit =
