@@ -10,6 +10,8 @@
 #include "logging.h"
 #include "TorqueDollyHandset.h"
 #include "TorqueDollyControlParameters.h"
+#include "HandsetBleOta.h"
+#include "device.h"
 
 extern portMUX_TYPE torqueDollyLinkStatsMux;
 extern volatile uint32_t torqueDollyLinkStatsSequence;
@@ -31,6 +33,7 @@ constexpr char STATUS_CHARACTERISTIC_UUID[] = "7f2a0003-6d4e-4c8a-9b11-2e4d7a8f3
 constexpr char JOYSTICK_DIAGNOSTIC_CHARACTERISTIC_UUID[] = "7f2a0004-6d4e-4c8a-9b11-2e4d7a8f3101";
 constexpr char AUTO_POWER_OFF_CHARACTERISTIC_UUID[] = "7f2a0005-6d4e-4c8a-9b11-2e4d7a8f3101";
 constexpr char RF_LINK_STATISTICS_CHARACTERISTIC_UUID[] = "7f2a0006-6d4e-4c8a-9b11-2e4d7a8f3101";
+constexpr char MAINTENANCE_CHARACTERISTIC_UUID[] = "7f2a0007-6d4e-4c8a-9b11-2e4d7a8f3101";
 constexpr char IDENTIFICATION[] = "TD-TX-BLE-B1";
 constexpr size_t STATUS_VALUE_MAX_LENGTH = 64;
 constexpr size_t JOYSTICK_DIAGNOSTIC_VALUE_LENGTH = 20;
@@ -62,6 +65,7 @@ static NimBLECharacteristic *rfLinkStatisticsCharacteristic = nullptr;
 static uint32_t lastRfLinkStatisticsPublishMs = 0;
 static NimBLEServer *bleServer = nullptr;
 static uint32_t lastRfLinkStatisticsDebugMs = 0;
+
 
 class StatusCharacteristicCallbacks final : public NimBLECharacteristicCallbacks
 {
@@ -250,13 +254,60 @@ public:
 
 static AutoPowerOffCharacteristicCallbacks autoPowerOffCallbacks;
 
+class MaintenanceCharacteristicCallbacks final : public NimBLECharacteristicCallbacks
+{
+public:
+    void onRead(NimBLECharacteristic *characteristic) override
+    {
+        const char *value = TorqueDollyHandset::isMaintenanceActive()
+            ? "MAINTENANCE_ACTIVE" : "LOCKED";
+        characteristic->setValue(reinterpret_cast<const uint8_t *>(value), strlen(value));
+    }
+
+    void onWrite(NimBLECharacteristic *characteristic) override
+    {
+        const std::string raw = characteristic->getValue();
+        if (raw == "ENTER")
+        {
+            const bool accepted = TorqueDollyHandset::enterMaintenance();
+            const char *response = accepted ? "MAINTENANCE_ACTIVE" : "ERR_NOT_LOCKED";
+            characteristic->setValue(reinterpret_cast<const uint8_t *>(response), strlen(response));
+        }
+        else if (raw == "EXIT")
+        {
+            const bool exited = TorqueDollyHandset::exitMaintenance();
+            characteristic->setValue(exited ? "LOCKED" : "ERR_TRANSFER_ACTIVE");
+        }
+        else
+        {
+            characteristic->setValue("ERR_COMMAND");
+        }
+    }
+};
+
+static MaintenanceCharacteristicCallbacks maintenanceCallbacks;
+static bool otaFastCadenceScheduled = false;
+
 static int event()
 {
+    const bool otaActive = isHandsetBleOtaTransferActive();
+    if (otaActive && !otaFastCadenceScheduled)
+    {
+        otaFastCadenceScheduled = true;
+        return 25;
+    }
+    if (!otaActive && otaFastCadenceScheduled)
+    {
+        otaFastCadenceScheduled = false;
+        return 500;
+    }
     return DURATION_IGNORE;
 }
 
 static int timeout()
 {
+    processHandsetBleOta();
+    otaFastCadenceScheduled = isHandsetBleOtaTransferActive();
     const uint32_t now = millis();
     const bool connected = bleServer != nullptr && bleServer->getConnectedCount() > 0;
     if (rfLinkStatisticsCharacteristic != nullptr &&
@@ -278,7 +329,10 @@ static int timeout()
             rfLinkStatisticsCharacteristic->notify();
         }
     }
-    return 500;
+    // Keep the BLE device's scheduler cadence unchanged when idle. Once an
+    // OTA session is active, service its single-packet worker every 25 ms;
+    // telemetry notifications remain independently rate-limited above to 500 ms.
+    return isHandsetBleOtaTransferActive() ? 25 : 500;
 }
 
 static int start()
@@ -379,6 +433,20 @@ static int start()
     }
     RfLinkStatisticsCharacteristicCallbacks::update(rfLinkStatisticsCharacteristic);
     rfLinkStatisticsCharacteristic->setCallbacks(&rfLinkStatisticsCallbacks);
+
+    setupHandsetBleOtaService(service, server);
+
+    NimBLECharacteristic *maintenanceCharacteristic = service->createCharacteristic(
+        MAINTENANCE_CHARACTERISTIC_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE,
+        24);
+    if (maintenanceCharacteristic == nullptr)
+    {
+        DBGLN("Torque Dolly BLE: maintenance characteristic creation failed");
+        return DURATION_NEVER;
+    }
+    maintenanceCharacteristic->setValue(TorqueDollyHandset::isMaintenanceActive() ? "MAINTENANCE_ACTIVE" : "LOCKED");
+    maintenanceCharacteristic->setCallbacks(&maintenanceCallbacks);
 
     if (!service->start())
     {

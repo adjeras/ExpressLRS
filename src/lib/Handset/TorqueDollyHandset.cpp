@@ -4,6 +4,7 @@
 
 #include "TorqueDollyHandset.h"
 #include "TorqueDollyControlParameters.h"
+#include "TorqueDollyMaintenance.h"
 #include "crsf_protocol.h"
 #include "common.h"
 #include "timingDiagnostics.h"
@@ -14,6 +15,7 @@ namespace
 {
 portMUX_TYPE diagnosticStateMux = portMUX_INITIALIZER_UNLOCKED;
 TorqueDollyDiagnosticState diagnosticState = TorqueDollyDiagnosticState::Locked;
+TorqueDollyMaintenanceLatch maintenanceLatch;
 portMUX_TYPE joystickSnapshotMux = portMUX_INITIALIZER_UNLOCKED;
 TorqueDollyJoystickSnapshot joystickSnapshot = {};
 }
@@ -220,16 +222,85 @@ bool TorqueDollyHandset::setAutoPowerOffMinutes(uint8_t minutes)
 
 bool TorqueDollyHandset::consumeAutoPowerOffRequest()
 {
+    // Keep the maintenance test and request consumption ordered against
+    // enterMaintenance(), which publishes the latch under diagnosticStateMux.
+    portENTER_CRITICAL(&diagnosticStateMux);
+    const bool maintenance = maintenanceLatch.active();
     portENTER_CRITICAL(&autoPowerOffStateMux);
-    const bool requested = autoPowerOffRequest;
+    const bool requested = autoPowerOffRequest && !maintenance;
     autoPowerOffRequest = false;
     portEXIT_CRITICAL(&autoPowerOffStateMux);
+    portEXIT_CRITICAL(&diagnosticStateMux);
     return requested;
 }
 
 bool TorqueDollyHandset::isAutoPowerOffSuspended()
 {
-    return torqueDollyPowerButtonHeld() || torqueDollyShutdownActive;
+    return torqueDollyPowerButtonHeld() || torqueDollyShutdownActive ||
+        isMaintenanceActive();
+}
+
+bool TorqueDollyHandset::enterMaintenance()
+{
+    portENTER_CRITICAL(&diagnosticStateMux);
+    const bool accepted = maintenanceLatch.enter(
+        diagnosticState == TorqueDollyDiagnosticState::Locked);
+    portEXIT_CRITICAL(&diagnosticStateMux);
+    if (accepted)
+    {
+        portENTER_CRITICAL(&autoPowerOffStateMux);
+        autoPowerOffRequest = false;
+        portEXIT_CRITICAL(&autoPowerOffStateMux);
+        Serial.println("OTA_MAINTENANCE ENTERED; outputs remain LOCKED");
+    }
+    return accepted;
+}
+
+bool TorqueDollyHandset::exitMaintenance()
+{
+    portENTER_CRITICAL(&diagnosticStateMux);
+    const bool exited = maintenanceLatch.exit();
+    if (exited) diagnosticState = TorqueDollyDiagnosticState::Locked;
+    portEXIT_CRITICAL(&diagnosticStateMux);
+    if (exited) Serial.println("OTA_MAINTENANCE EXITED; handset remains LOCKED");
+    else Serial.println("OTA_MAINTENANCE EXIT REFUSED; transfer active");
+    return exited;
+}
+
+bool TorqueDollyHandset::beginOtaTransfer()
+{
+    portENTER_CRITICAL(&diagnosticStateMux);
+    const bool accepted = maintenanceLatch.beginTransfer();
+    portEXIT_CRITICAL(&diagnosticStateMux);
+    if (accepted) {
+        portENTER_CRITICAL(&autoPowerOffStateMux);
+        autoPowerOffRequest = false;
+        portEXIT_CRITICAL(&autoPowerOffStateMux);
+    }
+    return accepted;
+}
+
+void TorqueDollyHandset::endOtaTransfer()
+{
+    portENTER_CRITICAL(&diagnosticStateMux);
+    maintenanceLatch.finishTransfer();
+    portEXIT_CRITICAL(&diagnosticStateMux);
+}
+
+bool TorqueDollyHandset::isMaintenanceActive()
+{
+    portENTER_CRITICAL(&diagnosticStateMux);
+    const bool active = maintenanceLatch.active();
+    portEXIT_CRITICAL(&diagnosticStateMux);
+    return active;
+}
+
+bool TorqueDollyHandset::maintenanceBlocksUnlock(bool powerButtonPressed)
+{
+    portENTER_CRITICAL(&diagnosticStateMux);
+    const bool blocked = maintenanceLatch.blocksUnlock(powerButtonPressed);
+    portEXIT_CRITICAL(&diagnosticStateMux);
+    return blocked;
 }
 
 void TorqueDollyHandset::Begin()
@@ -1017,19 +1088,30 @@ void TorqueDollyHandset::handleInput()
     }
 
     const auto buttonState = getTorqueDollyButtonSnapshot();
+    const bool handsetMaintenanceActive = isMaintenanceActive();
     const auto gestureState = readyState == ReadyState::Ready
         ? TorqueDollyButton::State::Ready
         : readyState == ReadyState::ControlledStop
             ? TorqueDollyButton::State::ControlledStop
             : TorqueDollyButton::State::Locked;
+    const bool unlockInterlocked =
+        maintenanceBlocksUnlock(buttonState.pressed);
     const bool canUnlock =
         !torqueDollyShutdownActive &&
+        !unlockInterlocked &&
         calibrationState == StartupCalibrationState::Succeeded &&
         calibrationWasComplete &&
         fabs(xNormalized) <= DEADBAND &&
         fabs(yNormalized) <= DEADBAND && !startupNeutral;
-    const auto buttonAction = buttonGesture.update(buttonState, gestureState,
-        canUnlock, BUTTON_UNLOCK_MIN_PRESS_MS, BUTTON_SHUTDOWN_PRESS_MS);
+    if (handsetMaintenanceActive || maintenanceLatch.transferActive())
+    {
+        // A long press begun before/during maintenance is not an unlock gesture.
+        buttonGesture.cancel();
+    }
+    const auto buttonAction = unlockInterlocked
+        ? TorqueDollyButton::Action::None
+        : buttonGesture.update(buttonState, gestureState,
+            canUnlock, BUTTON_UNLOCK_MIN_PRESS_MS, BUTTON_SHUTDOWN_PRESS_MS);
     if (buttonAction == TorqueDollyButton::Action::Lock)
     {
         readyState = ReadyState::ControlledStop;
@@ -1107,7 +1189,8 @@ void TorqueDollyHandset::handleInput()
     const bool firmwareUpdateActive =
         connectionState == wifiUpdate || connectionState == serialUpdate;
     const bool calibrationTimeoutSuspended =
-        torqueDollyPowerButtonHeld() || firmwareUpdateActive;
+        torqueDollyPowerButtonHeld() || firmwareUpdateActive ||
+        isAutoPowerOffSuspended();
 
     if (calibrationState == StartupCalibrationState::Succeeded)
     {
@@ -1345,7 +1428,7 @@ void TorqueDollyHandset::handleInput()
     buttonGesture.cancel();
 #endif
 
-    if (readyState != ReadyState::Ready)
+    if (handsetMaintenanceActive || readyState != ReadyState::Ready)
     {
         x = 0.0f;
         y = 0.0f;
@@ -1426,6 +1509,22 @@ void TorqueDollyHandset::handleInput()
         );
     }
 
+    if (handsetMaintenanceActive ||
+        maintenanceLatch.lockingAfterExit())
+    {
+        // Do not ramp while in maintenance or while exit is awaiting one
+        // neutral control-loop pass; only then acknowledge a locked exit.
+        xDrive = 0.0f;
+        yDrive = 0.0f;
+        x = 0.0f;
+        y = 0.0f;
+        readyState = ReadyState::Locked;
+        activityQualificationStartedAt = 0;
+        inactivityStartedAt = 0;
+        inactivityLocked = false;
+        if (!handsetMaintenanceActive) maintenanceLatch.acknowledgeLocked();
+    }
+
     if (
         readyState == ReadyState::ControlledStop &&
         fabs(xDrive) <= 0.0001f &&
@@ -1489,13 +1588,21 @@ void TorqueDollyHandset::handleInput()
     uint32_t leftChannel = mapDriveToCrsfChannel(leftDrive);
     uint32_t rightChannel = mapDriveToCrsfChannel(rightDrive);
 
+    // Serialize the final gate with enterMaintenance(): if maintenance is
+    // accepted, every outgoing handset channel is neutral before this task
+    // publishes the frame. No earlier Ready-state calculation can bypass it.
+    portENTER_CRITICAL(&diagnosticStateMux);
+    leftChannel = maintenanceLatch.channelOutput(
+        leftChannel, CRSF_CHANNEL_VALUE_MID);
+    rightChannel = maintenanceLatch.channelOutput(
+        rightChannel, CRSF_CHANNEL_VALUE_MID);
     for (uint32_t &channel : ChannelData)
     {
         channel = CRSF_CHANNEL_VALUE_MID;
     }
-
     ChannelData[0] = leftChannel;
     ChannelData[1] = rightChannel;
+    portEXIT_CRITICAL(&diagnosticStateMux);
     RCdataLastRecv = micros();
 
 #if defined(TORQUE_DOLLY_BLE_TELEMETRY)
@@ -1579,7 +1686,8 @@ void TorqueDollyHandset::handleInput()
 #if defined(TORQUE_DOLLY_BLE_TELEMETRY)
     TorqueDollyDiagnosticState publishedState =
         TorqueDollyDiagnosticState::Locked;
-    switch (readyState)
+    if (maintenanceLatch.requiresNeutralOutput()) publishedState = TorqueDollyDiagnosticState::Locked;
+    else switch (readyState)
     {
         case ReadyState::Locked:
             publishedState = TorqueDollyDiagnosticState::Locked;

@@ -3,6 +3,7 @@
 #include <cstdio>
 
 #include "TorqueDollyButton.h"
+#include "TorqueDollyMaintenance.h"
 
 namespace {
 constexpr uint32_t DEBOUNCE_MS = 30;
@@ -77,6 +78,32 @@ void testCanUnlockStillBlocks()
     assert(input.snapshot.duration == 700);
     assert(action == TorqueDollyButton::Action::None);
 }
+
+void testMaintenanceRequiresLockedAndAlwaysNeutral()
+{
+    TorqueDollyMaintenanceLatch maintenance;
+    assert(!maintenance.enter(false));
+    assert(!maintenance.active());
+    assert(maintenance.enter(true));
+    assert(maintenance.active());
+    assert(maintenance.blocksUnlock(true));
+    assert(maintenance.requiresNeutralOutput());
+    assert(maintenance.suspendsAutoPowerOff());
+    assert(maintenance.channelOutput(1000, 992) == 992);
+    assert(maintenance.channelOutput(100, 992) == 992);
+    assert(!maintenance.enter(true));
+    maintenance.exit();
+    assert(!maintenance.active());
+    assert(maintenance.lockingAfterExit());
+    assert(maintenance.requiresNeutralOutput());
+    assert(maintenance.channelOutput(1000, 992) == 992);
+    assert(maintenance.blocksUnlock(true)); // Require release after maintenance.
+    maintenance.acknowledgeLocked(); // Handset loop emitted the neutral frame.
+    assert(!maintenance.lockingAfterExit());
+    assert(!maintenance.blocksUnlock(false));
+    assert(maintenance.channelOutput(1000, 992) == 1000);
+    // The latch has no Ready state to restore: its caller exits to Locked.
+}
 }
 
 int main()
@@ -84,6 +111,7 @@ int main()
     testUnlockBoundaries();
     testShutdownBoundaries();
     testCanUnlockStillBlocks();
-    std::puts("PASS: production button debounce, unlock, shutdown, and eligibility tests");
+    testMaintenanceRequiresLockedAndAlwaysNeutral();
+    std::puts("PASS: production button and handset maintenance latch safety tests");
     return 0;
 }

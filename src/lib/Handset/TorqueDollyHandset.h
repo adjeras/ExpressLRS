@@ -55,6 +55,14 @@ public:
     static bool setAutoPowerOffMinutes(uint8_t minutes);
     static bool consumeAutoPowerOffRequest();
     static bool isAutoPowerOffSuspended();
+    // Maintenance may be entered only while the published handset state is LOCKED.
+    // Leaving maintenance never restores readiness; the handset remains LOCKED.
+    static bool enterMaintenance();
+    static bool exitMaintenance();
+    static bool beginOtaTransfer();
+    static void endOtaTransfer();
+    static bool isMaintenanceActive();
+    static bool maintenanceBlocksUnlock(bool powerButtonPressed);
 #endif
     bool IsArmed() override { return false; }
 };
